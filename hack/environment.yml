@@ -1,0 +1,9 @@
+name: vqvae
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python==3.10.8
+  - pytorch==2.1.2
+  - torchvision
+  - pytorch-cuda=12.1

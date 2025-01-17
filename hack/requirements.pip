@@ -1,0 +1,11 @@
+colorama
+flash-attn
+GPUtil
+seaborn
+termcolor
+tensorboard==2.12.0
+tensorboardX
+timm
+torch_tb_profiler
+transformers[torch]
+typed-argument-parser

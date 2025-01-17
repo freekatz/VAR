@@ -1,3 +1,16 @@
+*.png
+tmp/
+bak/
+*.zip
+*.tar
+*.gz
+test/
+exp
+output
+out
+release
+dataset_link
+.cache
 *.swp
 **/__pycache__/**
 **/.ipynb_checkpoints/**

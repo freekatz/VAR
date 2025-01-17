@@ -13,7 +13,7 @@ import pytz
 import torch
 import torch.distributed as tdist
 
-import dist
+from utils import dist_utils
 from utils import arg_util
 
 os_system = functools.partial(subprocess.call, shell=True)
@@ -39,15 +39,15 @@ def time_str(fmt='[%m-%d %H:%M:%S]'):
 
 def init_distributed_mode(local_out_path, only_sync_master=False, timeout=30):
     try:
-        dist.initialize(fork=False, timeout=timeout)
-        dist.barrier()
+        dist_utils.initialize(fork=False, timeout=timeout)
+        dist_utils.barrier()
     except RuntimeError:
         print(f'{">"*75}  NCCL Error  {"<"*75}', flush=True)
         time.sleep(10)
     
     if local_out_path is not None: os.makedirs(local_out_path, exist_ok=True)
-    _change_builtin_print(dist.is_local_master())
-    if (dist.is_master() if only_sync_master else dist.is_local_master()) and local_out_path is not None and len(local_out_path):
+    _change_builtin_print(dist_utils.is_local_master())
+    if (dist_utils.is_master() if only_sync_master else dist_utils.is_local_master()) and local_out_path is not None and len(local_out_path):
         sys.stdout, sys.stderr = SyncPrint(local_out_path, sync_stdout=True), SyncPrint(local_out_path, sync_stdout=False)
 
 
@@ -341,20 +341,21 @@ def glob_with_latest_modified_first(pattern, recursive=False):
     return sorted(glob.glob(pattern, recursive=recursive), key=os.path.getmtime, reverse=True)
 
 
-def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], int, int, dict, dict]:
+def maybe_resume(args: arg_util.Args) -> Tuple[List[str], int, int, dict, dict]:
     info = []
-    file = os.path.join(args.local_out_dir_path, pattern)
-    all_ckpt = glob_with_latest_modified_first(file)
-    if len(all_ckpt) == 0:
-        info.append(f'[auto_resume] no ckpt found @ {file}')
-        info.append(f'[auto_resume quit]')
+    resume = args.resume
+    if resume is None or resume == '':
         return info, 0, 0, {}, {}
-    else:
-        info.append(f'[auto_resume] load ckpt from @ {all_ckpt[0]} ...')
-        ckpt = torch.load(all_ckpt[0], map_location='cpu')
-        ep, it = ckpt['epoch'], ckpt['iter']
-        info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
-        return info, ep, it, ckpt['trainer'], ckpt['args']
+    try:
+        ckpt = torch.load(resume, map_location='cpu')
+    except Exception as e:
+        info.append(f'[auto_resume] failed, {e} @ {resume}')
+        return info, 0, 0, {}, {}
+
+    dist_utils.barrier()
+    ep, it = (ckpt['epoch'], ckpt['iter']) if 'iter' in ckpt else (ckpt['epoch'] + 1, 0)
+    info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
+    return info, ep, it, ckpt['trainer'], ckpt['args']
 
 
 def create_npz_from_sample_folder(sample_folder: str):

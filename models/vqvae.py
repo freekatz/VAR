@@ -51,6 +51,7 @@ class VQVAE(nn.Module):
         if self.test_mode:
             self.eval()
             [p.requires_grad_(False) for p in self.parameters()]
+        self.patch_hws = [(pn, pn) for pn in v_patch_nums]
     
     # ===================== `forward` is only used in VAE training =====================
     def forward(self, inp, ret_usages=False):   # -> rec_B3HW, idx_N, loss

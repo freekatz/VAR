@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-import dist
+from utils import dist_utils
 from models import VAR, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
@@ -60,8 +60,8 @@ class VARTrainer(object):
         self.var_wo_ddp.eval()
         for inp_B3HW, label_B in ld_val:
             B, V = label_B.shape[0], self.vae_local.vocab_size
-            inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-            label_B = label_B.to(dist.get_device(), non_blocking=True)
+            inp_B3HW = inp_B3HW.to(dist_utils.get_device(), non_blocking=True)
+            label_B = label_B.to(dist_utils.get_device(), non_blocking=True)
             
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
@@ -77,7 +77,7 @@ class VARTrainer(object):
         self.var_wo_ddp.train(training)
         
         stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
-        dist.allreduce(stats)
+        dist_utils.allreduce(stats)
         tot = round(stats[-1].item())
         stats /= tot
         L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
@@ -138,10 +138,10 @@ class VARTrainer(object):
         # log to tensorboard
         if g_it == 0 or (g_it + 1) % 500 == 0:
             prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
-            dist.allreduce(prob_per_class_is_chosen)
+            dist_utils.allreduce(prob_per_class_is_chosen)
             prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
             cluster_usage = (prob_per_class_is_chosen > 0.001 / V).float().mean().item() * 100
-            if dist.is_master():
+            if dist_utils.is_master():
                 if g_it == 0:
                     tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
                     tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)

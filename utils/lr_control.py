@@ -4,7 +4,7 @@ from typing import Tuple, List, Dict, Union
 
 import torch.nn
 
-import dist
+from utils import dist_utils
 
 
 def lr_wd_annealing(sche_type: str, optimizer, peak_lr, wd, wd_end, cur_it, wp_it, max_it, wp0=0.005, wpe=0.001):
@@ -98,10 +98,10 @@ def filter_params(model, nowd_keys=()) -> Tuple[
     
     print(f'[get_param_groups] param_groups = \n{pformat(para_groups_dbg, indent=2, width=240)}\n')
     
-    for rk in range(dist.get_world_size()):
-        dist.barrier()
-        if dist.get_rank() == rk:
-            print(f'[get_param_groups][rank{dist.get_rank()}] {type(model).__name__=} {count=}, {numel=}', flush=True, force=True)
+    for rk in range(dist_utils.get_world_size()):
+        dist_utils.barrier()
+        if dist_utils.get_rank() == rk:
+            print(f'[get_param_groups][rank{dist_utils.get_rank()}] {type(model).__name__=} {count=}, {numel=}', flush=True, force=True)
     print('')
     
     assert len(names_no_grad) == 0, f'[get_param_groups] names_no_grad = \n{pformat(names_no_grad, indent=2, width=240)}\n'

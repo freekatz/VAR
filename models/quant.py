@@ -5,7 +5,7 @@ import torch
 from torch import distributed as tdist, nn as nn
 from torch.nn import functional as F
 
-import dist
+from utils import dist_utils
 
 
 # this file only provides the VectorQuantizer2 used in VQVAE
@@ -76,7 +76,7 @@ class VectorQuantizer2(nn.Module):
                 
                 hit_V = idx_N.bincount(minlength=self.vocab_size).float()
                 if self.training:
-                    if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
+                    if dist_utils.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # calc loss
                 idx_Bhw = idx_N.view(B, pn, pn)
@@ -85,7 +85,7 @@ class VectorQuantizer2(nn.Module):
                 f_hat = f_hat + h_BChw
                 f_rest -= h_BChw
                 
-                if self.training and dist.initialized():
+                if self.training and dist_utils.initialized():
                     handler.wait()
                     if self.record_hit == 0: self.ema_vocab_hit_SV[si].copy_(hit_V)
                     elif self.record_hit < 100: self.ema_vocab_hit_SV[si].mul_(0.9).add_(hit_V.mul(0.1))
@@ -182,7 +182,18 @@ class VectorQuantizer2(nn.Module):
             pn_next = self.v_patch_nums[si+1]
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
-    
+
+    def idxBl_to_var2_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        next_scales = []
+        B = gt_ms_idx_Bl[0].shape[0]
+        C = self.Cvae
+        SN = len(self.v_patch_nums)
+
+        for si in range(SN):
+            pn = self.v_patch_nums[si]
+            next_scales.append(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn).view(B, C, -1).transpose(1, 2))
+        return torch.cat(next_scales, dim=1) if len(next_scales) else None  # cat BlCs to BLC, this should be float32
+
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
         HW = self.v_patch_nums[-1]

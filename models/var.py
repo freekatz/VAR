@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-import dist
+from utils import dist_utils
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
@@ -46,7 +46,7 @@ class VAR(nn.Module):
             cur += pn ** 2
         
         self.num_stages_minus_1 = len(self.patch_nums) - 1
-        self.rng = torch.Generator(device=dist.get_device())
+        self.rng = torch.Generator(device=dist_utils.get_device())
         
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
@@ -57,7 +57,7 @@ class VAR(nn.Module):
         # 2. class embedding
         init_std = math.sqrt(1 / self.C / 3)
         self.num_classes = num_classes
-        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
+        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist_utils.get_device())
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
@@ -201,7 +201,7 @@ class VAR(nn.Module):
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
             sos = cond_BD = self.class_emb(label_B)
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
-            
+
             if self.prog_si == 0: x_BLC = sos
             else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
@@ -310,3 +310,47 @@ class VARHF(VAR, PyTorchModelHubMixin):
             patch_nums=patch_nums,
             flash_if_available=flash_if_available, fused_if_available=fused_if_available,
         )
+
+
+if __name__ == '__main__':
+    patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    # VQVAE args
+    V = 4096
+    Cvae = 32
+    ch = 160
+    share_quant_resi = 4
+    depth = 16
+    shared_aln = False
+    attn_l2_norm = True
+    flash_if_available = True
+    fused_if_available = True
+    init_adaln = 0.5
+    init_adaln_gamma = 1e-5
+    init_head = 0.02
+    init_std = -1
+
+    vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
+                      v_patch_nums=patch_nums)
+
+    heads = depth
+    width = depth * 64
+    dpr = 0.1 * depth / 24
+    var_wo_ddp = VAR(
+        vae_local=vae_local, num_classes=1000,
+        depth=depth, embed_dim=width, num_heads=heads, drop_rate=0., attn_drop_rate=0.,
+        drop_path_rate=dpr,
+        norm_eps=1e-6, shared_aln=shared_aln, cond_drop_rate=0.1,
+        attn_l2_norm=attn_l2_norm,
+        patch_nums=patch_nums,
+        flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+    )
+    lq = torch.randn((2, 3, 256, 256))
+    gt_idx_Bl = vae_local.img_to_idxBl(lq)
+    gt_BL = torch.cat(gt_idx_Bl, dim=1)
+    x_BLCv_wo_first_l = vae_local.quantize.idxBl_to_var_input(gt_idx_Bl)
+    label = torch.tensor([1, 2], dtype=torch.long)
+    logits = var_wo_ddp(label, x_BLCv_wo_first_l)
+    img = var_wo_ddp.autoregressive_infer_cfg(
+        2, label
+    )
+    print(img.shape)

@@ -19,13 +19,16 @@ except ImportError as e:
     time.sleep(5)
     raise e
 
-import dist
+from utils import dist_utils
 
 
 class Args(Tap):
-    data_path: str = '/path/to/imagenet'
     exp_name: str = 'text'
-    
+    resume: str = ''            # if specified, load this checkpoint; if not, load the latest checkpoint in bed (if existing)
+    data_path: str = 'dataset_link' # datasets, split by - or _, o: openimages, cc: cc12m, co: coco, fa: face data(ffhq+HumanArt+afhq+Internal), mj: midjourney, p: pinterest, px: (pexels+pixabay+unsplash)
+    dataset_name: str = 'ffhq_blind'
+    vae_path: str = ''
+
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
     # VAR
@@ -49,8 +52,11 @@ class Args(Tap):
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
     ac: int = 1             # gradient accumulation
-    
-    ep: int = 250
+    prof: bool = False      # whether to do profile
+    profall: bool = False   # whether to do profile on all ranks
+    save_freq: int = 1
+
+    ep: int = 100
     wp: float = 0
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
@@ -66,25 +72,27 @@ class Args(Tap):
     
     # data
     pn: str = '1_2_3_4_5_6_8_10_13_16'
+    img_size: int = 256
     patch_size: int = 16
     patch_nums: tuple = None    # [automatically set; don't specify this] = tuple(map(int, args.pn.replace('-', '_').split('_')))
     resos: tuple = None         # [automatically set; don't specify this] = tuple(pn * args.patch_size for pn in args.patch_nums)
-    
+    num_classes: int = 1000
+
     data_load_reso: int = None  # [automatically set; don't specify this] would be max(patch_nums) * patch_size
     mid_reso: float = 1.125     # aug: first resize to mid_reso = 1.125 * data_load_reso, then crop to data_load_reso
     hflip: bool = False         # augmentation: horizontal flip
     workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
-    
+
     # progressive training
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
     pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
     pgwp: float = 0         # num of warmup epochs at each progressive stage
     
     # would be automatically set in runtime
-    cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
-    branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
-    commit_id: str = subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
-    commit_msg: str = (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
+    # cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
+    # branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
+    # commit_id: str = subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
+    # commit_msg: str = (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
     acc_mean: float = None      # [automatically set; don't specify this]
     acc_tail: float = None      # [automatically set; don't specify this]
     L_mean: float = None        # [automatically set; don't specify this]
@@ -109,7 +117,8 @@ class Args(Tap):
     
     tf32: bool = True       # whether to use TensorFloat32
     device: str = 'cpu'     # [automatically set; don't specify this]
-    seed: int = None        # seed
+    # seed: int = None        # seed
+    seed: int = np.random.randint(1, 10000)        # seed
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = benchmark
@@ -117,7 +126,7 @@ class Args(Tap):
             torch.backends.cudnn.deterministic = False
         else:
             torch.backends.cudnn.deterministic = True
-            seed = self.seed * dist.get_world_size() + dist.get_rank()
+            seed = self.seed * dist_utils.get_world_size() + dist_utils.get_rank()
             os.environ['PYTHONHASHSEED'] = str(seed)
             random.seed(seed)
             np.random.seed(seed)
@@ -130,7 +139,7 @@ class Args(Tap):
         if self.seed is None:
             return None
         g = torch.Generator()
-        g.manual_seed(self.seed * dist.get_world_size() + dist.get_rank())
+        g.manual_seed(self.seed * dist_utils.get_world_size() + dist_utils.get_rank())
         return g
     
     local_debug: bool = 'KEVIN_LOCAL' in os.environ
@@ -175,11 +184,11 @@ class Args(Tap):
             print(f'[tf32] [matmul] torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}')
     
     def dump_log(self):
-        if not dist.is_local_master():
+        if not dist_utils.is_local_master():
             return
         if '1/' in self.cur_ep: # first time to dump log
             with open(self.log_txt_path, 'w') as fp:
-                json.dump({'is_master': dist.is_master(), 'name': self.exp_name, 'cmd': self.cmd, 'commit': self.commit_id, 'branch': self.branch, 'tb_log_dir_path': self.tb_log_dir_path}, fp, indent=0)
+                json.dump({'is_master': dist_utils.is_master(), 'name': self.exp_name, 'tb_log_dir_path': self.tb_log_dir_path}, fp, indent=0)
                 fp.write('\n')
         
         log_dict = {}
@@ -240,21 +249,21 @@ def init_dist_and_get_args():
     args.seed_everything(benchmark=args.pg == 0)
     
     # update args: data loading
-    args.device = dist.get_device()
-    if args.pn == '256':
+    args.device = dist_utils.get_device()
+    if args.img_size == 256:
         args.pn = '1_2_3_4_5_6_8_10_13_16'
-    elif args.pn == '512':
+    elif args.img_size == 512:
         args.pn = '1_2_3_4_6_9_13_18_24_32'
-    elif args.pn == '1024':
+    elif args.img_size == 1024:
         args.pn = '1_2_3_4_5_7_9_12_16_21_27_36_48_64'
     args.patch_nums = tuple(map(int, args.pn.replace('-', '_').split('_')))
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
     args.data_load_reso = max(args.resos)
     
     # update args: bs and lr
-    bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())
+    bs_per_gpu = round(args.bs / args.ac / dist_utils.get_world_size())
     args.batch_size = bs_per_gpu
-    args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size()
+    args.bs = args.glb_batch_size = args.batch_size * dist_utils.get_world_size()
     args.workers = min(max(0, args.workers), args.batch_size)
     
     args.tlr = args.ac * args.tblr * args.glb_batch_size / 256
@@ -276,7 +285,7 @@ def init_dist_and_get_args():
     tb_name = _reg_valid_name.sub(
         '_',
         f'tb-VARd{args.depth}'
-        f'__pn{args.pn}'
+        f'__img{args.img_size}'
         f'__b{args.bs}ep{args.ep}{args.opt[:4]}lr{args.tblr:g}wd{args.twd:g}'
     )
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
