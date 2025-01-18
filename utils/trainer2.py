@@ -55,16 +55,16 @@ class VAR2Trainer(object):
         stt = time.time()
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
-        for lq, hq in ld_val:
-            B, V = lq.shape[0], self.vae_local.vocab_size
-            lq = lq.to(dist_utils.get_device(), non_blocking=True)
+        for _, hq in ld_val:
+            B, V = hq.shape[0], self.vae_local.vocab_size
+            # lq = lq.to(dist_utils.get_device(), non_blocking=True)
             hq = hq.to(dist_utils.get_device(), non_blocking=True)
             
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(hq)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
 
             self.var_wo_ddp.forward
-            logits_BLV = self.var_wo_ddp(lq)
+            logits_BLV = self.var_wo_ddp(hq)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
