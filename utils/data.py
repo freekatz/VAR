@@ -10,7 +10,7 @@ from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils import dist_utils
 from utils import arg_util
 from utils.my_dataset import UnlabeledDatasetFolder, FFHQ, FFHQBlind
-from utils.my_transforms import BlindTransform, NormTransform
+from utils.my_transforms import BlindTransform, NormTransform, normalize_01_into_pm1
 
 
 def build_transforms(args: arg_util.Args):
@@ -46,29 +46,31 @@ def build_transforms(args: arg_util.Args):
         'downsample_range': [4, 30],
         'noise_range': [0, 1],
         'jpeg_range': [30, 80],
-        'use_hflip': True,
-        'mean': [0.0, 0.0, 0.0],
-        'std': [1.0, 1.0, 1.0]
+        'use_hflip': False,
     }
         train_lq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             BlindTransform(opt),
-            NormTransform(opt),
+            NormTransform(),
         ]
         train_hq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             transforms.ToTensor(),
-            NormTransform(opt)
+            NormTransform()
         ]
         val_lq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             BlindTransform(opt),
-            NormTransform(opt),
+            NormTransform(),
         ]
         val_hq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             transforms.ToTensor(),
-            NormTransform(opt)
+            NormTransform()
         ]
         train_lq_transform, val_lq_transform = transforms.Compose(train_lq_aug), transforms.Compose(val_lq_aug)
         train_hq_transform, val_hq_transform = transforms.Compose(train_hq_aug), transforms.Compose(val_hq_aug)

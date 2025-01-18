@@ -331,6 +331,7 @@ if __name__ == '__main__':
 
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums)
+    vae_local.load_state_dict(torch.load('/Users/katz/Downloads/vae_ch160v4096z32.pth', map_location='cpu'))
 
     heads = depth
     width = depth * 64
@@ -344,13 +345,25 @@ if __name__ == '__main__':
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     )
-    lq = torch.randn((2, 3, 256, 256))
-    gt_idx_Bl = vae_local.img_to_idxBl(lq)
-    gt_BL = torch.cat(gt_idx_Bl, dim=1)
-    x_BLCv_wo_first_l = vae_local.quantize.idxBl_to_var_input(gt_idx_Bl)
-    label = torch.tensor([1, 2], dtype=torch.long)
-    logits = var_wo_ddp(label, x_BLCv_wo_first_l)
+
+    var_wo_ddp.load_state_dict(torch.load('../var_d16.pth', map_location='cpu'))
+    label = torch.tensor([1] * 4, dtype=torch.long)
     img = var_wo_ddp.autoregressive_infer_cfg(
-        2, label
+        4, label
     )
-    print(img.shape)
+
+    import PIL.Image as PImage
+    from torchvision.transforms import transforms
+    def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
+        B, C, H, W = img_tensor.shape
+        assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
+        b = int(math.sqrt(B))
+        img_tensor = torch.permute(img_tensor, (1, 0, 2, 3))
+        img_tensor = torch.reshape(img_tensor, (C, b, b * H, W))
+        img_tensor = torch.permute(img_tensor, (0, 2, 1, 3))
+        img_tensor = torch.reshape(img_tensor, (C, b * H, b * W))
+        img = transforms.ToPILImage()(img_tensor)
+        return img
+
+    pimg = tensor_to_img(img)
+    pimg.show()

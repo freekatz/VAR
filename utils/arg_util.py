@@ -41,7 +41,7 @@ class Args(Tap):
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
     fp16: int = 0           # 1: using fp16, 2: bf16
-    tblr: float = 1e-4      # base lr
+    tblr: float = 1e-3      # base lr, test: 1e-4 -> 1e-3
     tlr: float = None       # lr = base lr * (bs / 256)
     twd: float = 0.05       # initial wd
     twde: float = 0         # final wd, =twde or twd

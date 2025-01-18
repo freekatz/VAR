@@ -74,9 +74,9 @@ class FFHQBlind(Dataset):
     def __getitem__(self, index):
         path = self.samples[index]
         hq = self.loader(path)
-        lq = self.lq_transform(hq)
+        # lq = self.lq_transform(hq)
         hq = self.hq_transform(hq)
-        return lq, hq
+        return hq, hq
 
 
 if __name__ == '__main__':
@@ -102,14 +102,14 @@ if __name__ == '__main__':
         [
             transforms.Resize(256, interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
-            NormTransform(opt),
+            NormTransform(),
         ]
     )
     train_hq_aug = transforms.Compose(
         [
             transforms.Resize(256, interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
-            NormTransform(opt),
+            NormTransform(),
         ]
     )
     train_transform = {'lq_transform': train_lq_aug, 'hq_transform': train_hq_aug}

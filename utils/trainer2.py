@@ -29,10 +29,7 @@ class VAR2Trainer(object):
         self.quantize_local: VectorQuantizer2
         self.var_wo_ddp: VAR2 = var_wo_ddp  # after torch.compile
         self.var_opt = var_opt
-        
-        del self.var_wo_ddp.rng
-        self.var_wo_ddp.rng = torch.Generator(device=device)
-        
+
         self.label_smooth = label_smooth
         self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')

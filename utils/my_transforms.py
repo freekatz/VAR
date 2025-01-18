@@ -331,12 +331,8 @@ def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
 
 
 class NormTransform(torch.nn.Module):
-    def __init__(self, opt):
+    def __init__(self):
         super().__init__()
-        self.opt = opt
-
-        self.mean = opt.get('mean', [0.5, 0.5, 0.5])
-        self.std = opt.get('std', [0.5, 0.5, 0.5])
 
     def forward(self, img):
         return normalize_01_into_pm1(img)

@@ -32,6 +32,9 @@ class VAR2(nn.Module):
         flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
+        for param in vae_local.parameters():
+            param.requires_grad = False
+
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
@@ -42,16 +45,7 @@ class VAR2(nn.Module):
         
         self.patch_nums: Tuple[int] = patch_nums
         self.L = sum(pn ** 2 for pn in self.patch_nums)
-        self.first_l = self.patch_nums[0] ** 2
-        self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur+pn ** 2))
-            cur += pn ** 2
-        
-        self.num_stages_minus_1 = len(self.patch_nums) - 1
-        self.rng = torch.Generator(device=dist_utils.get_device())
-        
+
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
@@ -81,7 +75,7 @@ class VAR2(nn.Module):
                 cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
-                attn_l2_norm=attn_l2_norm,
+                attn_l2_norm=attn_l2_norm, add_cond=False,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
             )
             for block_idx in range(depth)
@@ -108,15 +102,14 @@ class VAR2(nn.Module):
         return self.head(h.float()).float()
     
     def forward(self, lq: torch.FloatTensor) -> torch.Tensor:  # returns logits_BLV
-        bg, ed = (0, self.L)
         B = lq.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             lq_idx  = self.vae_proxy[0].img_to_idxBl(lq)
             x_lq_BLC = self.vae_quant_proxy[0].idxBl_to_var2_input(lq_idx)
             x_BLC = self.word_embed(x_lq_BLC.float())
-            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
+            x_BLC += self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
         
-        attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
+        attn_bias = self.attn_bias_for_masking
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
@@ -226,7 +219,7 @@ if __name__ == '__main__':
 
 
     print(var_ckpt['trainer'].keys())
-    var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'])
+    var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=False)
 
     import PIL.Image as PImage
     from torchvision.transforms import InterpolationMode, transforms
@@ -253,20 +246,21 @@ if __name__ == '__main__':
         'downsample_range': [4, 30],
         'noise_range': [0, 1],
         'jpeg_range': [30, 80],
-        'use_hflip': True,
-        'mean': [0.0, 0.0, 0.0],
-        'std': [1.0, 1.0, 1.0]
+        'use_hflip': False,
     }
     final_reso = 256
+    mid_reso = 1.125
+    # build augmentations
+    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
     train_lq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             BlindTransform(opt),
-            # NormTransform(opt),
         ]
     train_hq_aug = [
-            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.RandomCrop((final_reso, final_reso)),
             transforms.ToTensor(),
-            # NormTransform(opt)
         ]
 
     train_lq_transform = transforms.Compose(train_lq_aug)

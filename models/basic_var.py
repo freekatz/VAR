@@ -129,7 +129,7 @@ class AdaLNSelfAttn(nn.Module):
     def __init__(
         self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
         num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
-        flash_if_available=False, fused_if_available=True,
+        add_cond=True, flash_if_available=False, fused_if_available=True,
     ):
         super(AdaLNSelfAttn, self).__init__()
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
@@ -140,17 +140,20 @@ class AdaLNSelfAttn(nn.Module):
         
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.shared_aln = shared_aln
-        if self.shared_aln:
-            self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5)
-        else:
-            lin = nn.Linear(cond_dim, 6*embed_dim)
-            self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
+        self.add_cond = add_cond
+        if self.add_cond:
+            if self.shared_aln:
+                self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim ** 0.5)
+            else:
+                lin = nn.Linear(cond_dim, 6 * embed_dim)
+                self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
         
         self.fused_add_norm_fn = None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(self, x, cond_BD, attn_bias):   # C: embed_dim, D: cond_dim
-        if cond_BD is not None:
+        if self.add_cond:
+            assert cond_BD is not None
             if self.shared_aln:
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(
                     2)  # 116C + B16C =unbind(2)=> 6 B1C
