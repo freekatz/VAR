@@ -1,10 +1,13 @@
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
+
 
 from utils import dist_utils
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
@@ -182,6 +185,8 @@ class VAR2(nn.Module):
 if __name__ == '__main__':
     import sys
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     # VQVAE args
     V = 4096
@@ -198,12 +203,13 @@ if __name__ == '__main__':
     init_head = 0.02
     init_std = -1
 
+    # var_ckpt = r'/Users/katz/Projects/var/test/ar-ckpt-best.pth'
+    var_ckpt = sys.argv[1]
+    var_ckpt = torch.load(var_ckpt, map_location='cpu')
+
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums)
-
-    # vae_ckpt = r'/Users/katz/Downloads/vae_ch160v4096z32.pth'
-    vae_ckpt = sys.argv[1]
-    vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'))
+    vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
 
     heads = depth
     width = depth * 64
@@ -218,9 +224,7 @@ if __name__ == '__main__':
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     )
 
-    # var_ckpt = r'/Users/katz/Projects/var/test/ar-ckpt-best.pth'
-    var_ckpt = sys.argv[2]
-    var_ckpt = torch.load(var_ckpt, map_location='cpu')
+
     print(var_ckpt['trainer'].keys())
     var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'])
 
@@ -255,23 +259,26 @@ if __name__ == '__main__':
     }
     final_reso = 256
     train_lq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
-            NormTransform(opt),
+            # NormTransform(opt),
         ]
     train_hq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
-            NormTransform(opt)
+            # NormTransform(opt)
         ]
 
     train_lq_transform = transforms.Compose(train_lq_aug)
     train_hq_transform = transforms.Compose(train_hq_aug)
 
-    root = sys.argv[3]
+    root = sys.argv[2]
     transform_dict = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform}
     ds = FFHQBlind(root=root, split='val', **transform_dict)
-    lq, hq = ds[3]
+    idx = 0
+    if len(sys.argv) > 3:
+        idx = int(sys.argv[3])
+    lq, hq = ds[idx]
     print(lq.shape, hq.shape)
 
     img_lq = transforms.ToPILImage()(lq)
@@ -286,3 +293,16 @@ if __name__ == '__main__':
     for i, im in enumerate(img):
         pim = transforms.ToPILImage()(im.squeeze(0))
         pim.save(f'../out/lq-{i}.png')
+
+    swap = False
+    if len(sys.argv) > 4:
+        swap = True
+    if swap:
+        lq = hq
+        logits = var_wo_ddp(lq.unsqueeze(0))
+        pred = logits.argmax(dim=-1)
+        pred = list(torch.split(pred, [ph*pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+        img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+        for i, im in enumerate(img):
+            pim = transforms.ToPILImage()(im.squeeze(0))
+            pim.save(f'../out/lq-{i}-swaped.png')

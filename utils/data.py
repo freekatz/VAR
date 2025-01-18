@@ -13,10 +13,6 @@ from utils.my_dataset import UnlabeledDatasetFolder, FFHQ, FFHQBlind
 from utils.my_transforms import BlindTransform, NormTransform
 
 
-def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
-    return x.add(x).add_(-1)
-
-
 def build_transforms(args: arg_util.Args):
     dataset_name = args.dataset_name
     final_reso = args.data_load_reso
@@ -55,22 +51,22 @@ def build_transforms(args: arg_util.Args):
         'std': [1.0, 1.0, 1.0]
     }
         train_lq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
             NormTransform(opt),
         ]
         train_hq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             NormTransform(opt)
         ]
         val_lq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
             NormTransform(opt),
         ]
         val_hq_aug = [
-            transforms.Resize(final_reso, interpolation=InterpolationMode.LANCZOS),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             NormTransform(opt)
         ]

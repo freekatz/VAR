@@ -325,6 +325,11 @@ class BlindTransform(torch.nn.Module):
 
         return img_in
 
+
+def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
+    return x.add(x).add_(-1)
+
+
 class NormTransform(torch.nn.Module):
     def __init__(self, opt):
         super().__init__()
@@ -334,5 +339,4 @@ class NormTransform(torch.nn.Module):
         self.std = opt.get('std', [0.5, 0.5, 0.5])
 
     def forward(self, img):
-        normalize(img, self.mean, self.std, inplace=True)
-        return img
+        return normalize_01_into_pm1(img)
