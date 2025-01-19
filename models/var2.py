@@ -32,9 +32,6 @@ class VAR2(nn.Module):
         flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
-        for param in vae_local.parameters():
-            param.requires_grad = False
-
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
@@ -246,20 +243,18 @@ if __name__ == '__main__':
         'downsample_range': [4, 30],
         'noise_range': [0, 1],
         'jpeg_range': [30, 80],
-        'use_hflip': False,
+        'use_hflip': True,
     }
     final_reso = 256
     mid_reso = 1.125
     # build augmentations
     mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
     train_lq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
         ]
     train_hq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
         ]
 

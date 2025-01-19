@@ -46,29 +46,25 @@ def build_transforms(args: arg_util.Args):
         'downsample_range': [4, 30],
         'noise_range': [0, 1],
         'jpeg_range': [30, 80],
-        'use_hflip': False,
+        'use_hflip': True,
     }
         train_lq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
             NormTransform(),
         ]
         train_hq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             NormTransform()
         ]
         val_lq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),
             NormTransform(),
         ]
         val_hq_aug = [
-            transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
-            transforms.RandomCrop((final_reso, final_reso)),
+            transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             transforms.ToTensor(),
             NormTransform()
         ]
