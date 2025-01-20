@@ -26,7 +26,7 @@ class VAR2(nn.Module):
     def __init__(
         self, vae_local: VQVAE,
         depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
+        norm_eps=1e-6, shared_aln=False,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
@@ -37,7 +37,6 @@ class VAR2(nn.Module):
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
         
-        self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
         
         self.patch_nums: Tuple[int] = patch_nums
@@ -208,7 +207,7 @@ if __name__ == '__main__':
         vae_local=vae_local,
         depth=depth, embed_dim=width, num_heads=heads, drop_rate=0., attn_drop_rate=0.,
         drop_path_rate=dpr,
-        norm_eps=1e-6, shared_aln=shared_aln, cond_drop_rate=0.1,
+        norm_eps=1e-6, shared_aln=shared_aln,
         attn_l2_norm=attn_l2_norm,
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,

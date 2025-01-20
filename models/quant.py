@@ -92,10 +92,24 @@ class VectorQuantizer2(nn.Module):
                     else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01))
                     self.record_hit += 1
                 vocab_hit_V.add_(hit_V)
+
+                # 前半部分只考虑 f 梯度，后半部分只考虑 f_hat 梯度
                 mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
             
             mean_vq_loss *= 1. / SN
+            # VQVAE: straight through gradient estimation, copy the gradient on fhat_BChw to f_BChw
+            # 通过这种方式，fhat_BChw 在反向传播时会拥有 f_BChw 的梯度，即使在前向传播中 fhat_BChw 是通过离散的向量量化操作得到的。
             f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
+            # # calc loss
+            # vq_loss = F.mse_loss(fhat_BChw.detach(), f_BChw).mul_(self.beta) + F.mse_loss(fhat_BChw, f_BChw.detach())  # 量化损失使用 fhat_BChw.detach()，这意味着在计算梯度时，不会考虑 fhat_BChw 的梯度，而码本损失使用 f_BChw.detach()，这意味着在计算梯度时，不会考虑 f_BChw 的梯度。
+            # “直通梯度”（Straight-Through Gradient, STG）估计
+            #
+            # fhat_BChw.detach()：是重建的特征图，从计算图中分离出来，不追踪梯度。
+            # f_BChw.detach()：是原始的特征图，同样从计算图中分离出来，不追踪梯度。
+            # (fhat_BChw.detach() - f_BChw.detach())：计算重建特征图和原始特征图之间的差异，这两个张量都不参与梯度计算。
+            # .add_(f_BChw)：是一个原地操作，将原始特征图 f_BChw 加到差异上，更新 fhat_BChw 的值。
+            # 通过这种方式，fhat_BChw 在反向传播时会拥有 f_BChw 的梯度，即使在前向传播中 fhat_BChw 是通过离散的向量量化操作得到的。这样做的目的是让模型能够学习到如何调整原始特征图 f_BChw，以便在向量量化和重建过程中最小化重建误差。
+
         
         margin = tdist.get_world_size() * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08
         # margin = pn*pn / 100

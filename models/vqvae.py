@@ -15,15 +15,19 @@ from .quant import VectorQuantizer2
 
 class VQVAE(nn.Module):
     def __init__(
-        self, vocab_size=4096, z_channels=32, ch=128, dropout=0.0,
-        beta=0.25,              # commitment loss weight
-        using_znorm=False,      # whether to normalize when computing the nearest neighbors
-        quant_conv_ks=3,        # quant conv kernel size
-        quant_resi=0.5,         # 0.5 means \phi(x) = 0.5conv(x) + (1-0.5)x
-        share_quant_resi=4,     # use 4 \phi layers for K scales: partially-shared \phi
-        default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)
-        v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]
-        test_mode=True,
+            self,
+            vocab_size=4096,  # 词元大小
+            z_channels=32,  # latent 维度
+            ch=128,  # ResnetBlock 的起始维度，按照 ch_mult=(1, 1, 2, 2, 4) 得到每一层的 in_channels 和 out_channels
+            dropout=0.0,
+            beta=0.25,              # 表示 self.quant_conv(self.encoder(inp)) 与 f_hat 的 loss 的权重，只在 train vae 时候用到
+            using_znorm=False,      # whether to normalize when computing the nearest neighbors
+            quant_conv_ks=3,        # quant conv kernel size
+            quant_resi=0.5,         # 0.5 means \phi(x) = 0.5conv(x) + (1-0.5)x，残差块输出特征的权重
+            share_quant_resi=4,     # use 4 \phi layers for K scales: partially-shared \phi，共享残差块的数量
+            default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)，残差块的数量
+            v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]，代表每个尺度下的词元图像 h 和 w
+            test_mode=True,
     ):
         super().__init__()
         self.test_mode = test_mode

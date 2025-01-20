@@ -336,3 +336,15 @@ class NormTransform(torch.nn.Module):
 
     def forward(self, img):
         return normalize_01_into_pm1(img)
+
+
+def denormalize_pm1_into_01(x):  # denormalize x from [-1, 1] to [0, 1] by (x + 1)/2
+    return x.add(1)/2
+
+
+class DenormTransform(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, img):
+        return denormalize_pm1_into_01(img)

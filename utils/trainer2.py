@@ -49,6 +49,22 @@ class VAR2Trainer(object):
         self.first_prog = True
     
     @torch.no_grad()
+    def test_ep(self, ld_test: DataLoader):
+        stt = time.time()
+        training = self.var_wo_ddp.training
+        self.var_wo_ddp.eval()
+        for lq, hq in ld_test:
+            lq = lq.to(dist_utils.get_device(), non_blocking=True)
+            self.var_wo_ddp.forward
+            # TODO inference method
+            hq_res = self.var_wo_ddp.inference(lq)
+
+            # TODO save the hq and hq_res img in one img, with ep, iter, img name
+        self.var_wo_ddp.train(training)
+        
+        return time.time()-stt
+
+    @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):
         tot = 0
         L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
@@ -59,25 +75,27 @@ class VAR2Trainer(object):
             B, V = hq.shape[0], self.vae_local.vocab_size
             # lq = lq.to(dist_utils.get_device(), non_blocking=True)
             hq = hq.to(dist_utils.get_device(), non_blocking=True)
-            
+
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(hq)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
 
             self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(hq)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
-            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
+            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V),
+                                    gt_BL[:, -self.last_l:].reshape(-1)) * B
+            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100 / gt_BL.shape[1])
+            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (
+                        100 / self.last_l)
             tot += B
         self.var_wo_ddp.train(training)
-        
+
         stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
         dist_utils.allreduce(stats)
         tot = round(stats[-1].item())
         stats /= tot
         L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
-        return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
+        return L_mean, L_tail, acc_mean, acc_tail, tot, time.time() - stt
     
     def train_step(
         self, it: int, g_it: int, stepping: bool, metric_lg: MetricLogger, tb_lg: TensorboardLogger,
