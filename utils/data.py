@@ -39,14 +39,18 @@ def build_transforms_params(args: arg_util.Args):
         train_transform, val_transform = {'transform': train_aug}, {'transform': val_aug}
     elif dataset_name in ['ffhq_blind']:
         opt = {
-        'blur_kernel_size': 41,
-        'kernel_list': ['iso', 'aniso'],
-        'kernel_prob': [0.5, 0.5],
-        'blur_sigma': [1, 15],
-        'downsample_range': [4, 30],
-        'noise_range': [0, 1],
-        'jpeg_range': [30, 80],
-    }
+            'blur_kernel_size': 41,
+            'kernel_list': ['iso', 'aniso'],
+            'kernel_prob': [0.5, 0.5],
+            'blur_sigma': [1, 15],
+            'downsample_range': [4, 30],
+            'noise_range': [0, 20],
+            'jpeg_range': [30, 80],
+            # 'color_jitter_prob': 0.3,
+            # 'color_jitter_shift': 20,
+            # 'color_jitter_pt_prob': 0.3,
+            # 'gray_prob': 0.01,
+        }
         train_lq_aug = [
             transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
             BlindTransform(opt),

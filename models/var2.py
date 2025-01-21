@@ -374,27 +374,18 @@ if __name__ == '__main__':
 
     from utils.my_transforms import BlindTransform, NormTransform, denormalize_pm1_into_01
 
-
-    def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
-        B, C, H, W = img_tensor.shape
-        assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
-        b = int(math.sqrt(B))
-        img_tensor = torch.permute(img_tensor, (1, 0, 2, 3))
-        img_tensor = torch.reshape(img_tensor, (C, b, b * H, W))
-        img_tensor = torch.permute(img_tensor, (0, 2, 1, 3))
-        img_tensor = torch.reshape(img_tensor, (C, b * H, b * W))
-        img = transforms.ToPILImage()(img_tensor)
-        return img
-
     opt = {
         'blur_kernel_size': 41,
         'kernel_list': ['iso', 'aniso'],
         'kernel_prob': [0.5, 0.5],
         'blur_sigma': [1, 15],
         'downsample_range': [4, 30],
-        'noise_range': [0, 1],
+        'noise_range': [0, 20],
         'jpeg_range': [30, 80],
-        'use_hflip': True,
+        # 'color_jitter_prob': 0.3,
+        # 'color_jitter_shift': 20,
+        # 'color_jitter_pt_prob': 0.3,
+        # 'gray_prob': 0.01,
     }
     final_reso = 256
     mid_reso = 1.125
@@ -416,7 +407,7 @@ if __name__ == '__main__':
 
     params = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform, 'use_hflip': True}
     ds = FFHQBlind(root=data_root, split='train', **params)
-    idx = 0
+    idx = 5
     if len(sys.argv) > arg_idx:
         idx = int(sys.argv[arg_idx])
         arg_idx+=1
@@ -431,16 +422,19 @@ if __name__ == '__main__':
     img_hq = transforms.ToPILImage()(denormalize_pm1_into_01(hq))
     img_lq.save('../out/lq.png')
     img_hq.save('../out/hq.png')
+
     logits = var_wo_ddp(lq.unsqueeze(0))
     pred = torch.argmax(logits, dim=-1)
     pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
     img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+    img.insert(0, lq.unsqueeze(0))
+    img.insert(0, hq.unsqueeze(0))
     img = torch.cat(img, dim=0)
     img = denormalize_pm1_into_01(img)
-    chw = torchvision.utils.make_grid(img, nrow=5, padding=0, pad_value=1.0)
+    chw = torchvision.utils.make_grid(img, nrow=4, padding=0, pad_value=1.0)
     chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
     chw = PImage.fromarray(chw.astype(np.uint8))
-    chw.save('../out/lq-res.png')
+    chw.save(f'../out/{idx}-lq-res.png')
 
     swap = False
     if len(sys.argv) > 4:
@@ -451,9 +445,11 @@ if __name__ == '__main__':
         pred = logits.argmax(dim=-1)
         pred = list(torch.split(pred, [ph*pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
         img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+        img.insert(0, lq.unsqueeze(0))
+        img.insert(0, hq.unsqueeze(0))
         img = torch.cat(img, dim=0)
         img = denormalize_pm1_into_01(img)
-        chw = torchvision.utils.make_grid(img, nrow=5, padding=0, pad_value=1.0)
+        chw = torchvision.utils.make_grid(img, nrow=4, padding=0, pad_value=1.0)
         chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
         chw = PImage.fromarray(chw.astype(np.uint8))
-        chw.save('../out/hq-res.png')
+        chw.save(f'../out/{idx}-hq-res.png')

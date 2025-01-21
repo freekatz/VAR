@@ -1,10 +1,10 @@
 import os
 
 import PIL.Image as PImage
+import random
 from torch.utils.data import Dataset
 from torchvision.datasets.folder import DatasetFolder, IMG_EXTENSIONS
 from torchvision.transforms import transforms
-from torchvision.transforms.v2 import ToTensor
 
 from utils.my_transforms import NormTransform, BlindTransform, print_transforms
 
@@ -64,6 +64,8 @@ class FFHQBlind(Dataset):
             self.samples = [os.path.join(self.root, line.strip()) for line in file.readlines() if line.find('.png') != -1]
         assert(len(self.samples) > 0)
 
+        self.identify_ratio = kwargs.get('identify_ratio', 0.)
+
         use_hflip = kwargs.get('use_hflip', False)
         base_transform = []
         if use_hflip:
@@ -83,18 +85,18 @@ class FFHQBlind(Dataset):
         path = self.samples[index]
         hq = self.loader(path)
         hq = self.base_transform(hq)
-        lq = self.lq_transform(hq)
-        hq = self.hq_transform(hq)
-        if self.split == 'val':
-            return hq, hq
-        return lq, hq
+        hq_res = self.hq_transform(hq)
+        if self.split == 'val' or random.random() > (1-self.identify_ratio) :
+            return hq_res, hq_res
+        lq_res = self.lq_transform(hq)
+        return lq_res, hq_res
 
 
 if __name__ == '__main__':
     import math
     import torch
     import cv2
-    from torchvision.transforms import InterpolationMode, transforms
+    from torchvision.transforms import InterpolationMode
 
     data = '../tmp'
     opt = {
@@ -105,9 +107,6 @@ if __name__ == '__main__':
         'downsample_range': [4, 30],
         'noise_range': [0, 1],
         'jpeg_range': [30, 80],
-        'use_hflip': True,
-        'mean': [0.0, 0.0, 0.0],
-        'std': [1.0, 1.0, 1.0]
     }
     train_lq_aug = transforms.Compose(
         [
@@ -123,7 +122,7 @@ if __name__ == '__main__':
             NormTransform(),
         ]
     )
-    train_transform = {'lq_transform': train_lq_aug, 'hq_transform': train_hq_aug}
+    train_transform = {'lq_transform': train_lq_aug, 'hq_transform': train_hq_aug, 'use_hflip': True}
     ds = FFHQBlind(root=data, split='train', **train_transform)
     lq, hq = ds[3]
     print(lq.size())
@@ -131,8 +130,7 @@ if __name__ == '__main__':
     print(lq.min(), lq.max(), lq.mean(), lq.std())
     print(hq.min(), hq.max(), hq.mean(), hq.std())
 
-    import PIL.Image as PImage
-    from torchvision.transforms import InterpolationMode, transforms
+    from torchvision.transforms import InterpolationMode
 
     img_lq = transforms.ToPILImage()(lq)
     img_hq = transforms.ToPILImage()(hq)

@@ -194,13 +194,6 @@ class BlindTransform(torch.nn.Module):
 
         # perform corrupt
         self.use_corrupt = opt.get('use_corrupt', True)
-        self.use_motion_kernel = False
-        # self.use_motion_kernel = opt.get('use_motion_kernel', True)
-
-        if self.use_motion_kernel:
-            self.motion_kernel_prob = opt.get('motion_kernel_prob', 0.001)
-            motion_kernel_path = opt.get('motion_kernel_path', 'basicsr/data/motion-blur-kernels-32.pth')
-            self.motion_kernels = torch.load(motion_kernel_path)
 
         if self.use_corrupt:
             # degradation configurations
@@ -269,12 +262,6 @@ class BlindTransform(torch.nn.Module):
         # generate in image
         img_in = img_gt
         if self.use_corrupt:
-            # motion blur
-            if self.use_motion_kernel and random.random() < self.motion_kernel_prob:
-                m_i = random.randint(0, 31)
-                k = self.motion_kernels[f'{m_i:02d}']
-                img_in = cv2.filter2D(img_in, -1, k)
-
             # gaussian blur
             kernel = gaussian_kernels.random_mixed_kernels(
                 self.kernel_list,
