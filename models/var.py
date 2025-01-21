@@ -30,8 +30,6 @@ class VAR(nn.Module):
             flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
-        vae_local.eval()
-        [p.requires_grad_(False) for p in vae_local.parameters()]
 
         # 0. hyperparameters
         assert embed_dim % num_heads == 0

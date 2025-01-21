@@ -33,7 +33,7 @@ def build_tensorboard_logger(args: arg_util.Args):
 
 def build_model(args):
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var2
+    from models import VAR2, VQVAE, build_vae_var2
 
     vae_local, var_wo_ddp = build_vae_var2(
         V=4096, Cvae=32, ch=160, share_quant_resi=4,  # hard-coded VQVAE hyperparameters
@@ -45,7 +45,7 @@ def build_model(args):
     vae_local.load_state_dict(torch.load(args.vae_path, map_location='cpu'), strict=True)
 
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
+    var_wo_ddp: VAR2 = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist_utils.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist_utils.get_local_rank()],
                                                               find_unused_parameters=True, broadcast_buffers=False)
 

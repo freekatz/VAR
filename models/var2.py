@@ -36,19 +36,6 @@ class VAR2(nn.Module):
             flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
-        fix_modules = ['decoder', 'quantize', 'post_quant_conv']
-        pt_modules = ['encoder', 'quant_conv']
-        vae_local.train()
-        if fix_modules is not None:
-            for module in fix_modules:
-                print(f'Freezing vqvae module {module} requires grad = False')
-                for param in getattr(vae_local, module).parameters():
-                    param.requires_grad = False
-        if pt_modules is not None:
-            for module in pt_modules:
-                print(f'Pretrain vqvae module {module} requires grad = True')
-                for param in getattr(vae_local, module).parameters():
-                    param.requires_grad = True
 
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
@@ -334,7 +321,7 @@ class VAR2(nn.Module):
 if __name__ == '__main__':
     import sys
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = 'cpu'
 
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     # VQVAE args

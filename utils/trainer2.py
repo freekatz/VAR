@@ -7,7 +7,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from utils import dist_utils
-from models import VAR, VQVAE, VectorQuantizer2
+from models import VAR2, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
 
@@ -20,14 +20,14 @@ BTen = torch.BoolTensor
 class VAR2Trainer(object):
     def __init__(
             self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-            vae_local: VQVAE, var_wo_ddp: VAR, var: DDP,
+            vae_local: VQVAE, var_wo_ddp: VAR2, var: DDP,
             var_opt: AmpOptimizer, label_smooth: float,
     ):
         super(VAR2Trainer, self).__init__()
 
         self.var, self.vae_local, self.quantize_local = var, vae_local, vae_local.quantize
         self.quantize_local: VectorQuantizer2
-        self.var_wo_ddp: VAR = var_wo_ddp  # after torch.compile
+        self.var_wo_ddp: VAR2 = var_wo_ddp  # after torch.compile
         self.var_opt = var_opt
 
         del self.var_wo_ddp.rng
