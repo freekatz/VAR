@@ -6,7 +6,7 @@ from torchvision.datasets.folder import DatasetFolder, IMG_EXTENSIONS
 from torchvision.transforms import transforms
 from torchvision.transforms.v2 import ToTensor
 
-from utils.my_transforms import NormTransform, BlindTransform
+from utils.my_transforms import NormTransform, BlindTransform, print_transforms
 
 
 def pil_loader(path):
@@ -55,14 +55,22 @@ class FFHQ(Dataset):
 
 
 class FFHQBlind(Dataset):
-    def __init__(self, root, lq_transform, hq_transform, split='train'):
+    def __init__(self, root, lq_transform, hq_transform, split='train', **kwargs):
         super().__init__()
         self.root = root
+        self.split = split
         split_file = os.path.join(self.root, f'ffhq_{split}.txt')
         with open(split_file, 'r') as file:
             self.samples = [os.path.join(self.root, line.strip()) for line in file.readlines() if line.find('.png') != -1]
         assert(len(self.samples) > 0)
-        print(f'Dataset size: {len(self.samples)}')
+
+        use_hflip = kwargs.get('use_hflip', False)
+        base_transform = []
+        if use_hflip:
+            base_transform.insert(0, transforms.RandomHorizontalFlip(0.5))
+        self.base_transform = transforms.Compose(base_transform)
+        for aug in base_transform:
+            print_transforms(aug, f'[{split}-base]')
 
         self.lq_transform = lq_transform
         self.hq_transform = hq_transform
@@ -74,9 +82,12 @@ class FFHQBlind(Dataset):
     def __getitem__(self, index):
         path = self.samples[index]
         hq = self.loader(path)
-        # lq = self.lq_transform(hq)
+        hq = self.base_transform(hq)
+        lq = self.lq_transform(hq)
         hq = self.hq_transform(hq)
-        return hq, hq
+        if self.split == 'val':
+            return hq, hq
+        return lq, hq
 
 
 if __name__ == '__main__':

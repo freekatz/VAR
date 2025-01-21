@@ -10,6 +10,7 @@ from utils import dist_utils
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
+from utils.my_dataset import FFHQBlind
 
 
 class SharedAdaLin(nn.Linear):
@@ -29,6 +30,9 @@ class VAR(nn.Module):
             flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
+        vae_local.eval()
+        [p.requires_grad_(False) for p in vae_local.parameters()]
+
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
@@ -180,10 +184,12 @@ class VAR(nn.Module):
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            print('x', x.shape)
             logits_BlV = self.get_logits(x, cond_BD)
 
             t = cfg * ratio
             logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            print('logits_BlV', logits_BlV.shape)
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -215,7 +221,10 @@ class VAR(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
+            print(label_B.shape)
             sos = cond_BD = self.class_emb(label_B)
+            print(cond_BD.shape)
+
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
             if self.prog_si == 0:
@@ -225,7 +234,10 @@ class VAR(nn.Module):
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
 
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
+        print(cond_BD.shape)
+
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        print(cond_BD_or_gss.shape)
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
@@ -370,13 +382,14 @@ if __name__ == '__main__':
     )
 
     var_wo_ddp.load_state_dict(torch.load('../var_d16.pth', map_location='cpu'))
-    label = torch.tensor([1] * 4, dtype=torch.long)
-    img = var_wo_ddp.autoregressive_infer_cfg(
-        4, label
-    )
 
     import PIL.Image as PImage
-    from torchvision.transforms import transforms
+    from torchvision.transforms import InterpolationMode, transforms
+    import torch
+
+    from utils.my_transforms import BlindTransform, NormTransform
+
+
     def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
         B, C, H, W = img_tensor.shape
         assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
@@ -388,5 +401,72 @@ if __name__ == '__main__':
         img = transforms.ToPILImage()(img_tensor)
         return img
 
-    pimg = tensor_to_img(img)
-    pimg.show()
+
+    opt = {
+        'blur_kernel_size': 41,
+        'kernel_list': ['iso', 'aniso'],
+        'kernel_prob': [0.5, 0.5],
+        'blur_sigma': [1, 15],
+        'downsample_range': [4, 30],
+        'noise_range': [0, 1],
+        'jpeg_range': [30, 80],
+        'use_hflip': True,
+    }
+    final_reso = 256
+    mid_reso = 1.125
+    # build augmentations
+    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
+    train_lq_aug = [
+        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+        BlindTransform(opt),
+    ]
+    train_hq_aug = [
+        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
+        transforms.ToTensor(),
+    ]
+
+    train_lq_transform = transforms.Compose(train_lq_aug)
+    train_hq_transform = transforms.Compose(train_hq_aug)
+
+    transform_dict = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform}
+    ds = FFHQBlind(root='../tmp', split='train', **transform_dict)
+    idx = 0
+    lq, hq = ds[idx]
+    print(lq.shape, hq.shape)
+
+    img_lq = transforms.ToPILImage()(lq)
+    img_hq = transforms.ToPILImage()(hq)
+    img_lq.save('../out/lq.png')
+    img_hq.save('../out/hq.png')
+
+    label = torch.tensor([0] * 1, dtype=torch.long)
+    # hq = torch.randn((4, 3, 256, 256))
+    idx = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
+    inp = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx)
+    logits = var_wo_ddp(label, inp)
+    pred = torch.argmax(logits, dim=-1)
+    pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+    img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+    for i, im in enumerate(img):
+        pim = transforms.ToPILImage()(im.squeeze(0))
+        pim.save(f'../out/var-{i}.png')
+
+    # img = var_wo_ddp.autoregressive_infer_cfg(
+    #     4, label
+    # )
+    #
+    # import PIL.Image as PImage
+    # from torchvision.transforms import transforms
+    # def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
+    #     B, C, H, W = img_tensor.shape
+    #     assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
+    #     b = int(math.sqrt(B))
+    #     img_tensor = torch.permute(img_tensor, (1, 0, 2, 3))
+    #     img_tensor = torch.reshape(img_tensor, (C, b, b * H, W))
+    #     img_tensor = torch.permute(img_tensor, (0, 2, 1, 3))
+    #     img_tensor = torch.reshape(img_tensor, (C, b * H, b * W))
+    #     img = transforms.ToPILImage()(img_tensor)
+    #     return img
+    #
+    # pimg = tensor_to_img(img)
+    # pimg.show()

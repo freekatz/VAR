@@ -178,5 +178,45 @@ class AdaLNBeforeHead(nn.Module):
         self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), nn.Linear(D, 2*C))
     
     def forward(self, x_BLC: torch.Tensor, cond_BD: torch.Tensor):
+        if cond_BD is None:
+            return self.ln_wo_grad(x_BLC)
         scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
         return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
+
+
+class TransformerSALayer(nn.Module):
+    def __init__(self, embed_dim, nhead=8, dim_mlp=2048, dropout=0.0, activation="gelu"):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(embed_dim, nhead, dropout=dropout)
+        # Implementation of Feedforward model - MLP
+        self.linear1 = nn.Linear(embed_dim, dim_mlp)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_mlp, embed_dim)
+
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = F.gelu
+
+    def with_pos_embed(self, tensor, pos=None):
+        return tensor if pos is None else tensor + pos
+
+    def forward(self, tgt,
+                tgt_mask= None,
+                tgt_key_padding_mask = None,
+                query_pos = None):
+        # self attention
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+
+        # ffn
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout2(tgt2)
+        return tgt
+

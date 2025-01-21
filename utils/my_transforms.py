@@ -12,6 +12,15 @@ from utils.img_util import img2tensor
 from utils import gaussian_kernels
 
 
+def print_transforms(transform, label):
+    print(f'Transform {label} = ')
+    if hasattr(transform, 'transforms'):
+        for t in transform.transforms:
+            print(t)
+    else:
+        print(transform)
+    print('---------------------------\n')
+
 def mod_crop(img, scale):
     """Mod crop images, used during testing.
 
@@ -254,10 +263,7 @@ class BlindTransform(torch.nn.Module):
 
     def forward(self, img):
         # pil to cv2
-        img = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
-
-        # random horizontal flip
-        img_gt = augment(img, hflip=self.opt['use_hflip'], rotation=False, return_status=False)
+        img_gt = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
         h, w, _ = img_gt.shape
 
         # generate in image

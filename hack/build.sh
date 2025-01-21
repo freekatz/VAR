@@ -8,14 +8,12 @@ PWD=$(cd "$(dirname "$0")"/../;pwd)
 cd $PWD
 rm -rf output
 mkdir -p output
-mkdir -p out
 cd output
 cp -r ../Makefile ./
 cp -r ../hack ./
 cp -r ../utils ./
 cp -r ../models ./
 cp -r ../scripts ./
-cp -r ../out ./
 cp -r ../*.py ./
 
 cd ../

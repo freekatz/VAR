@@ -52,9 +52,9 @@ class VQVAE(nn.Module):
         self.quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
         self.post_quant_conv = torch.nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks//2)
         
-        if self.test_mode:
-            self.eval()
-            [p.requires_grad_(False) for p in self.parameters()]
+        # if self.test_mode:
+        #     self.eval()
+        #     [p.requires_grad_(False) for p in self.parameters()]
         self.patch_hws = [(pn, pn) for pn in v_patch_nums]
     
     # ===================== `forward` is only used in VAE training =====================

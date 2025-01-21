@@ -10,7 +10,7 @@ import torch
 
 from utils import dist_utils
 from utils import arg_util, misc
-from utils.data import build_transforms, build_data_loader
+from utils.data import build_data_loader, build_transforms_params
 from utils.misc import maybe_resume
 
 
@@ -96,9 +96,11 @@ def build_everything(args: arg_util.Args):
     
     # build data
     print(f'[build PT data] ...\n')
-    train_transform, val_transform = build_transforms(args)
-    ld_train = build_data_loader(args, start_ep, start_it, dataset=None, transform_list=train_transform, split='train')
-    ld_val = build_data_loader(args, start_ep, start_it, dataset=None, transform_list=val_transform, split='val')
+    train_params, val_params = build_transforms_params(args)
+    train_params['use_hflip'] = args.hflip
+    val_params['use_hflip'] = args.hflip
+    ld_train = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=train_params, split='train')
+    ld_val = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=val_params, split='val')
 
     [print(line) for line in auto_resume_info]
     print(f'[dataloader multi processing] ...', end='', flush=True)
