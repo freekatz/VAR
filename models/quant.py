@@ -198,15 +198,20 @@ class VectorQuantizer2(nn.Module):
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
 
     def idxBl_to_var2_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> (torch.Tensor, torch.Tensor):
-        next_scales = []
+        scales = []
         B = gt_ms_idx_Bl[0].shape[0]
         C = self.Cvae
+        H = W = self.v_patch_nums[-1]
         SN = len(self.v_patch_nums)
 
+        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
         for si in range(SN):
             pn = self.v_patch_nums[si]
-            next_scales.append(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn).view(B, C, -1).transpose(1, 2))
-        return next_scales[0].squeeze(1), torch.cat(next_scales, dim=1) if len(next_scales) else None  # cat BlCs to BLC, this should be float32
+            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
+            h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn), size=(H, W), mode='bicubic')
+            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
+            scales.append(F.interpolate(f_hat, size=(pn, pn), mode='area').view(B, C, -1).transpose(1, 2))
+        return gt_ms_idx_Bl[0], torch.cat(scales, dim=1) if len(scales) else None  # cat BlCs to BLC, this should be float32
 
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference

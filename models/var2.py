@@ -66,8 +66,8 @@ class VAR2(nn.Module):
         # self.num_classes = num_classes
         # self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
         #                                device=dist_utils.get_device())
-        # self.cond_embed = nn.Embedding(self.V, self.C)
-        # nn.init.trunc_normal_(self.cond_embed.weight.data, mean=0, std=init_std)
+        self.cond_embed = nn.Embedding(self.V, self.C)
+        nn.init.trunc_normal_(self.cond_embed.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
 
@@ -149,40 +149,32 @@ class VAR2(nn.Module):
         B = lq.shape[0]
 
         idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-        cond, x_BLCv_wo_first_l_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-        x_BLC_lq = torch.split(x_BLCv_wo_first_l_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws], dim=1)
+        cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
+        x_BLC_lq = self.word_embed(x_BLCv_lq.float())
+        x_BLC_lq = torch.split(x_BLC_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws], dim=1)
 
-        sos = cond_BD = self.word_embed(cond.squeeze(-1))
+        sos = cond_BD = self.cond_embed(cond.squeeze(-1))
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         pos_start = self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        next_token_map_lq = self.word_embed(cond.unsqueeze(1))
         next_token_map_hq = sos.unsqueeze(1).expand(B, self.first_l, -1) + pos_start
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
+            next_token_map_lq = x_BLC_lq[si]
+
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             cur_L += pn * pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map_lq
-            y = next_token_map_hq
+            x = next_token_map_hq
+            y = next_token_map_lq
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, y=y, cond_BD=cond_BD_or_gss, attn_bias=None)
-            # x torch.Size([2, 1, 1024])
-            # x torch.Size([2, 4, 1024])
-            # x torch.Size([2, 9, 1024])
-            # x torch.Size([2, 16, 1024])
-            # x torch.Size([2, 25, 1024])
-            # x torch.Size([2, 36, 1024])
-            # x torch.Size([2, 64, 1024])
-            # x torch.Size([2, 100, 1024])
-            # x torch.Size([2, 169, 1024])
-            # x torch.Size([2, 256, 1024])
-            logits_BlV = self.get_logits(next_token_map_lq, cond_BD)
+            logits_BlV = self.get_logits(y, cond_BD)
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -199,11 +191,6 @@ class VAR2(nn.Module):
                 next_token_map_hq = next_token_map_hq.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map_hq = self.word_embed(next_token_map_hq) + lvl_pos[:,
                                                                    cur_L:cur_L + self.patch_nums[si + 1] ** 2]
-
-                next_token_map_lq = x_BLC_lq[si]
-                next_token_map_lq = self.word_embed(next_token_map_lq) + lvl_pos[:,
-                                                                   cur_L:cur_L + self.patch_nums[si + 1] ** 2]
-
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
 
@@ -213,7 +200,7 @@ class VAR2(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
             cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-            sos = cond_BD = self.word_embed(cond.squeeze(-1))
+            sos = cond_BD = self.cond_embed(cond.squeeze(-1))
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
             if self.prog_si == 0:
@@ -242,16 +229,6 @@ class VAR2(nn.Module):
             x_BLC_hq = b(x=x_BLC_hq, y=x_BLC_lq, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
         # x_BLC torch.Size([1, 680, 1024])
         x_BLC_hq = self.get_logits(x_BLC_hq.float(), cond_BD)
-
-        if self.prog_si == 0:
-            if isinstance(self.word_embed, nn.Linear):
-                x_BLC_hq[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
-            else:
-                s = 0
-                for p in self.word_embed.parameters():
-                    if p.requires_grad:
-                        s += p.view(-1)[0] * 0
-                x_BLC_hq[0, 0, 0] += s
         return x_BLC_hq  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
@@ -435,7 +412,7 @@ if __name__ == '__main__':
     else:
         idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
         idx_lq = var_wo_ddp.vae_proxy[0].img_to_idxBl(lq.unsqueeze(0))
-        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_lq)
+        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_hq)
         logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
