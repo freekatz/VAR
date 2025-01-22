@@ -182,12 +182,21 @@ class VAR(nn.Module):
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            print('x', x.shape)
+            # x torch.Size([2, 1, 1024])
+            # x torch.Size([2, 4, 1024])
+            # x torch.Size([2, 9, 1024])
+            # x torch.Size([2, 16, 1024])
+            # x torch.Size([2, 25, 1024])
+            # x torch.Size([2, 36, 1024])
+            # x torch.Size([2, 64, 1024])
+            # x torch.Size([2, 100, 1024])
+            # x torch.Size([2, 169, 1024])
+            # x torch.Size([2, 256, 1024])
             logits_BlV = self.get_logits(x, cond_BD)
 
             t = cfg * ratio
             logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            print('logits_BlV', logits_BlV.shape)
+            # print('logits_BlV', logits_BlV.shape)
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -219,9 +228,7 @@ class VAR(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            print(label_B.shape)
             sos = cond_BD = self.class_emb(label_B)
-            print(cond_BD.shape)
 
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
@@ -232,10 +239,7 @@ class VAR(nn.Module):
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
 
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        print(cond_BD.shape)
-
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-        print(cond_BD_or_gss.shape)
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
@@ -248,6 +252,7 @@ class VAR(nn.Module):
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        # x_BLC torch.Size([1, 680, 1024])
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
         if self.prog_si == 0:

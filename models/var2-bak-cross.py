@@ -150,7 +150,7 @@ class VAR2(nn.Module):
 
         idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
         cond, x_BLCv_wo_first_l_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-        x_BLC_lq = torch.split(x_BLCv_wo_first_l_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws], dim=1)
+        x_BLC_lq = torch.split(x_BLCv_wo_first_l_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws[1:]], dim=1)
 
         sos = cond_BD = self.word_embed(cond.squeeze(-1))
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
@@ -167,8 +167,8 @@ class VAR2(nn.Module):
             cur_L += pn * pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map_lq
-            y = next_token_map_hq
+            x = next_token_map_hq
+            y = next_token_map_lq
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, y=y, cond_BD=cond_BD_or_gss, attn_bias=None)
@@ -182,7 +182,7 @@ class VAR2(nn.Module):
             # x torch.Size([2, 100, 1024])
             # x torch.Size([2, 169, 1024])
             # x torch.Size([2, 256, 1024])
-            logits_BlV = self.get_logits(next_token_map_lq, cond_BD)
+            logits_BlV = self.get_logits(next_token_map_hq, cond_BD)
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -212,47 +212,47 @@ class VAR2(nn.Module):
         B = lq.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-            cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
+            cond, x_BLCv_wo_first_l_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
             sos = cond_BD = self.word_embed(cond.squeeze(-1))
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
             if self.prog_si == 0:
-                x_BLC_lq = sos
+                x_BLC = sos
                 x_BLC_hq = sos
             else:
-                x_BLC_lq = self.word_embed(x_BLCv_lq.float())
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l_lq.float())), dim=1)
                 x_BLC_hq = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l_hq.float())), dim=1)
-            # x_BLC_lq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-            x_BLC_hq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
+            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
+            # x_BLC_hq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
 
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         # hack: get the dtype if mixed precision is used
-        temp = x_BLC_hq.new_ones(8, 8)
+        temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
 
-        x_BLC_lq = x_BLC_lq.to(dtype=main_type)
+        x_BLC = x_BLC.to(dtype=main_type)
         x_BLC_hq = x_BLC_hq.to(dtype=main_type)
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
         AdaLNCrossAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC_hq = b(x=x_BLC_hq, y=x_BLC_lq, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+            x_BLC = b(x=x_BLC, y=x_BLC_hq, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
         # x_BLC torch.Size([1, 680, 1024])
-        x_BLC_hq = self.get_logits(x_BLC_hq.float(), cond_BD)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
-                x_BLC_hq[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
+                x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
             else:
                 s = 0
                 for p in self.word_embed.parameters():
                     if p.requires_grad:
                         s += p.view(-1)[0] * 0
-                x_BLC_hq[0, 0, 0] += s
-        return x_BLC_hq  # logits BLV, V is vocab_size
+                x_BLC[0, 0, 0] += s
+        return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
@@ -424,9 +424,9 @@ if __name__ == '__main__':
     if len(sys.argv) > arg_idx:
         swap = True
         arg_idx += 1
-    inference = False
+    inference = True
     if len(sys.argv) > arg_idx:
-        inference = True
+        inference = False
         arg_idx += 1
 
     x_BLCv_wo_first_l = None
@@ -435,7 +435,7 @@ if __name__ == '__main__':
     else:
         idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
         idx_lq = var_wo_ddp.vae_proxy[0].img_to_idxBl(lq.unsqueeze(0))
-        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_lq)
+        _, x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
         logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))

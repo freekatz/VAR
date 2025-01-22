@@ -3,18 +3,20 @@ from functools import partial
 from typing import Optional, Tuple, Union
 import sys, os
 
+import numpy as np
+import torchvision
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 
 import torch
 import torch.nn as nn
-import numpy as np
-import torchvision
+from huggingface_hub import PyTorchModelHubMixin
 
 from utils import dist_utils
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, AdaLNCrossAttn
+from utils.my_dataset import FFHQBlind
+from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
-from utils.my_dataset import FFHQBlind
 
 
 class SharedAdaLin(nn.Linear):
@@ -26,7 +28,7 @@ class SharedAdaLin(nn.Linear):
 class VAR2(nn.Module):
     def __init__(
             self, vae_local: VQVAE,
-            num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0.,
+            depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0.,
             drop_path_rate=0.,
             norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
             attn_l2_norm=False,
@@ -59,15 +61,14 @@ class VAR2(nn.Module):
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
-        self.word_embed = nn.Linear(self.Cvae, self.C)
+        self.word_embed = nn.Sequential(
+            nn.Linear(self.Cvae, self.C),
+            nn.ReLU()
+        )
 
-        # 2. class embedding
+        # 2. cond embedding
         init_std = math.sqrt(1 / self.C / 3)
-        # self.num_classes = num_classes
-        # self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
-        #                                device=dist_utils.get_device())
-        # self.cond_embed = nn.Embedding(self.V, self.C)
-        # nn.init.trunc_normal_(self.cond_embed.weight.data, mean=0, std=init_std)
+        nn.init.trunc_normal_(self.word_embed[0].weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
 
@@ -93,7 +94,7 @@ class VAR2(nn.Module):
         dpr = [x.item() for x in
                torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
         self.blocks = nn.ModuleList([
-            AdaLNCrossAttn(
+            AdaLNSelfAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
@@ -138,25 +139,36 @@ class VAR2(nn.Module):
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
-            self, lq: torch.FloatTensor,
+            self, lq: torch.Tensor,
             g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
             more_smooth=False,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
+        """
+        only used for inference, on autoregressive mode
+        :param B: batch size
+        :param label_B: imagenet label; if None, randomly sampled
+        :param g_seed: random seed
+        :param cfg: classifier-free guidance ratio
+        :param top_k: top-k sampling
+        :param top_p: top-p sampling
+        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        """
         if g_seed is None:
             rng = None
         else:
             self.rng.manual_seed(g_seed); rng = self.rng
+
         B = lq.shape[0]
 
         idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-        cond, x_BLCv_wo_first_l_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-        x_BLC_lq = torch.split(x_BLCv_wo_first_l_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws], dim=1)
-
+        cond, _ = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
         sos = cond_BD = self.word_embed(cond.squeeze(-1))
+
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        pos_start = self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        next_token_map_lq = self.word_embed(cond.unsqueeze(1))
-        next_token_map_hq = sos.unsqueeze(1).expand(B, self.first_l, -1) + pos_start
+        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l,
+                                                                                                  -1) + lvl_pos[:,
+                                                                                                        :self.first_l]
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
@@ -167,22 +179,16 @@ class VAR2(nn.Module):
             cur_L += pn * pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map_lq
-            y = next_token_map_hq
+            x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, y=y, cond_BD=cond_BD_or_gss, attn_bias=None)
-            # x torch.Size([2, 1, 1024])
-            # x torch.Size([2, 4, 1024])
-            # x torch.Size([2, 9, 1024])
-            # x torch.Size([2, 16, 1024])
-            # x torch.Size([2, 25, 1024])
-            # x torch.Size([2, 36, 1024])
-            # x torch.Size([2, 64, 1024])
-            # x torch.Size([2, 100, 1024])
-            # x torch.Size([2, 169, 1024])
-            # x torch.Size([2, 256, 1024])
-            logits_BlV = self.get_logits(next_token_map_lq, cond_BD)
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            # print('x', x.shape)
+            logits_BlV = self.get_logits(x, cond_BD)
+
+            t = cfg * ratio
+            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            # print('logits_BlV', logits_BlV.shape)
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -193,66 +199,63 @@ class VAR2(nn.Module):
                          self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
 
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map_hq = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums),
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums),
                                                                                           f_hat, h_BChw)
             if si != self.num_stages_minus_1:  # prepare for next stage
-                next_token_map_hq = next_token_map_hq.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map_hq = self.word_embed(next_token_map_hq) + lvl_pos[:,
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map) + lvl_pos[:,
                                                                    cur_L:cur_L + self.patch_nums[si + 1] ** 2]
-
-                next_token_map_lq = x_BLC_lq[si]
-                next_token_map_lq = self.word_embed(next_token_map_lq) + lvl_pos[:,
-                                                                   cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)  # double the batch sizes due to CFG
 
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(f_hat)
 
-    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l_hq: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, lq: torch.FloatTensor) -> torch.Tensor:  # returns logits_BLV
+        """
+        :param label_B: label_B
+        :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
+        :return: logits BLV, V is vocab_size
+        """
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = lq.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
             idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-            cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
+            cond, x_BLCv_wo_first_l = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
             sos = cond_BD = self.word_embed(cond.squeeze(-1))
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
 
             if self.prog_si == 0:
-                x_BLC_lq = sos
-                x_BLC_hq = sos
+                x_BLC = sos
             else:
-                x_BLC_lq = self.word_embed(x_BLCv_lq.float())
-                x_BLC_hq = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l_hq.float())), dim=1)
-            # x_BLC_lq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-            x_BLC_hq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
 
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         # hack: get the dtype if mixed precision is used
-        temp = x_BLC_hq.new_ones(8, 8)
+        temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
 
-        x_BLC_lq = x_BLC_lq.to(dtype=main_type)
-        x_BLC_hq = x_BLC_hq.to(dtype=main_type)
+        x_BLC = x_BLC.to(dtype=main_type)
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
-        AdaLNCrossAttn.forward
+        AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC_hq = b(x=x_BLC_hq, y=x_BLC_lq, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        # x_BLC torch.Size([1, 680, 1024])
-        x_BLC_hq = self.get_logits(x_BLC_hq.float(), cond_BD)
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
-                x_BLC_hq[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
+                x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
             else:
                 s = 0
                 for p in self.word_embed.parameters():
                     if p.requires_grad:
                         s += p.view(-1)[0] * 0
-                x_BLC_hq[0, 0, 0] += s
-        return x_BLC_hq  # logits BLV, V is vocab_size
+                x_BLC[0, 0, 0] += s
+        return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
@@ -338,7 +341,6 @@ if __name__ == '__main__':
 
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums)
-
     heads = depth
     width = depth * 64
     dpr = 0.1 * depth / 24
@@ -354,6 +356,7 @@ if __name__ == '__main__':
     vae_local.eval()
     var_wo_ddp.eval()
 
+    # var_ckpt = r'/Users/katz/Projects/var/test/ar-ckpt-best.pth'
     data_root =  sys.argv[1]
     arg_idx = 2
     if len(sys.argv) > arg_idx:
@@ -404,11 +407,11 @@ if __name__ == '__main__':
 
     params = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform, 'use_hflip': True}
     ds = FFHQBlind(root=data_root, split='train', **params)
-    data_idx = 0
+    idx = 5
     if len(sys.argv) > arg_idx:
-        data_idx = int(sys.argv[arg_idx])
+        idx = int(sys.argv[arg_idx])
         arg_idx+=1
-    lq, hq = ds[data_idx]
+    lq, hq = ds[idx]
     print(lq.shape, hq.shape)
 
     from pathlib import Path
@@ -420,49 +423,33 @@ if __name__ == '__main__':
     img_lq.save('../out/lq.png')
     img_hq.save('../out/hq.png')
 
-    swap = False
-    if len(sys.argv) > arg_idx:
-        swap = True
-        arg_idx += 1
-    inference = False
-    if len(sys.argv) > arg_idx:
-        inference = True
-        arg_idx += 1
-
-    x_BLCv_wo_first_l = None
-    if inference:
-        img = [var_wo_ddp.autoregressive_infer_cfg(lq.unsqueeze(0))]
-    else:
-        idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
-        idx_lq = var_wo_ddp.vae_proxy[0].img_to_idxBl(lq.unsqueeze(0))
-        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_lq)
-        logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
-        pred = torch.argmax(logits, dim=-1)
-        pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
-        img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+    logits = var_wo_ddp(lq.unsqueeze(0))
+    pred = torch.argmax(logits, dim=-1)
+    pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+    img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
     img.insert(0, lq.unsqueeze(0))
     img.insert(0, hq.unsqueeze(0))
     img = torch.cat(img, dim=0)
     img = denormalize_pm1_into_01(img)
-    chw = torchvision.utils.make_grid(img, nrow=3, padding=0, pad_value=1.0)
+    chw = torchvision.utils.make_grid(img, nrow=4, padding=0, pad_value=1.0)
     chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
     chw = PImage.fromarray(chw.astype(np.uint8))
-    chw.save(f'../out/{data_idx}-lq-res.png')
+    chw.save(f'../out/{idx}-lq-res.png')
 
+    swap = False
+    if len(sys.argv) > 4:
+        swap = True
     if swap:
         lq = hq
-        if inference:
-            img = [var_wo_ddp.autoregressive_infer_cfg(lq.unsqueeze(0))]
-        else:
-            logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
-            pred = torch.argmax(logits, dim=-1)
-            pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
-            img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
+        logits = var_wo_ddp(lq.unsqueeze(0))
+        pred = logits.argmax(dim=-1)
+        pred = list(torch.split(pred, [ph*pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+        img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
         img.insert(0, lq.unsqueeze(0))
         img.insert(0, hq.unsqueeze(0))
         img = torch.cat(img, dim=0)
         img = denormalize_pm1_into_01(img)
-        chw = torchvision.utils.make_grid(img, nrow=3, padding=0, pad_value=1.0)
+        chw = torchvision.utils.make_grid(img, nrow=4, padding=0, pad_value=1.0)
         chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
         chw = PImage.fromarray(chw.astype(np.uint8))
-        chw.save(f'../out/{data_idx}-hq-res.png')
+        chw.save(f'../out/{idx}-hq-res.png')

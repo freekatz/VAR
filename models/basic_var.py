@@ -125,6 +125,102 @@ class SelfAttention(nn.Module):
         return f'using_flash={self.using_flash}, using_xform={self.using_xform}, attn_l2_norm={self.attn_l2_norm}'
 
 
+class CrossAttention(nn.Module):
+    def __init__(
+            self, block_idx, in_dim, embed_dim, num_heads=12,
+            attn_drop=0., proj_drop=0., attn_l2_norm=False, flash_if_available=True,
+    ):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.block_idx, self.num_heads, self.head_dim = block_idx, num_heads, embed_dim // num_heads  # =64
+        self.attn_l2_norm = attn_l2_norm
+        if self.attn_l2_norm:
+            self.scale = 1
+            self.scale_mul_1H11 = nn.Parameter(torch.full(size=(1, self.num_heads, 1, 1), fill_value=4.0).log(),
+                                               requires_grad=True)
+            self.max_scale_mul = torch.log(torch.tensor(100)).item()
+        else:
+            self.scale = 0.25 / math.sqrt(self.head_dim)
+
+        self.mat_q = nn.Linear(in_dim, embed_dim, bias=False)
+        self.mat_k = nn.Linear(in_dim, embed_dim, bias=False)
+        self.mat_v = nn.Linear(in_dim, embed_dim, bias=False)
+        self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
+        self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
+
+        self.proj = nn.Linear(embed_dim, in_dim)
+        self.proj_drop = nn.Dropout(proj_drop, inplace=True) if proj_drop > 0 else nn.Identity()
+        self.attn_drop: float = attn_drop
+        self.using_flash = flash_if_available and flash_attn_func is not None
+        self.using_xform = flash_if_available and memory_efficient_attention is not None
+
+        # only used during inference
+        self.caching, self.cached_k, self.cached_v = False, None, None
+
+    def kv_caching(self, enable: bool):
+        self.caching, self.cached_k, self.cached_v = enable, None, None
+
+    # NOTE: attn_bias is None during inference because kv cache is enabled
+    def forward(self, x, y, attn_bias):
+        B, L, _ = x.shape
+        C = self.embed_dim
+
+        q = F.linear(input=x, weight=self.mat_q.weight, bias=self.q_bias)
+        q = q.view(B, L, self.num_heads, self.head_dim)
+        k = F.linear(input=y, weight=self.mat_k.weight, bias=self.zero_k_bias)
+        k = k.view(B, L, self.num_heads, self.head_dim)
+        v = F.linear(input=y, weight=self.mat_v.weight, bias=self.zero_k_bias)
+        v = v.view(B, L, self.num_heads, self.head_dim)
+
+        main_type = q.dtype
+        # qkv: BL3Hc
+
+        using_flash = self.using_flash and attn_bias is None and q.dtype != torch.float32
+        if not using_flash and not self.using_xform:
+            q = q.transpose(1, 2)  # BLHc -> BHLc
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            dim_cat = 2  # q or k or v: BHLc
+        else:
+            dim_cat = 1
+
+        if self.attn_l2_norm:
+            scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
+            if using_flash or self.using_xform: scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
+            q = F.normalize(q, dim=-1).mul(scale_mul)
+            k = F.normalize(k, dim=-1)
+
+        if self.caching:
+            if self.cached_k is None:
+                self.cached_k = k; self.cached_v = v
+            else:
+                k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat(
+                    (self.cached_v, v), dim=dim_cat)
+
+        dropout_p = self.attn_drop if self.training else 0.0
+        if using_flash:
+            oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type),
+                                  dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
+        elif self.using_xform:
+            oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type),
+                                             attn_bias=None if attn_bias is None else attn_bias.to(
+                                                 dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p,
+                                             scale=self.scale).view(B, L, C)
+        else:
+            oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias,
+                            dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
+
+        return self.proj_drop(self.proj(oup))
+        # attn = (q @ k.transpose(-2, -1)).add_(attn_bias + self.local_rpb())  # BHLc @ BHcL => BHLL
+        # attn = self.attn_drop(attn.softmax(dim=-1))
+        # oup = (attn @ v).transpose_(1, 2).reshape(B, L, -1)     # BHLL @ BHLc = BHLc => BLHc => BLC
+
+    def extra_repr(self) -> str:
+        return f'using_flash={self.using_flash}, using_xform={self.using_xform}, attn_l2_norm={self.attn_l2_norm}'
+
+
 class AdaLNSelfAttn(nn.Module):
     def __init__(
         self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
@@ -169,6 +265,53 @@ class AdaLNSelfAttn(nn.Module):
     def extra_repr(self) -> str:
         return f'shared_aln={self.shared_aln}'
 
+class AdaLNCrossAttn(nn.Module):
+    def __init__(
+            self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
+            num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
+            add_cond=True, flash_if_available=False, fused_if_available=True,
+    ):
+        super(AdaLNCrossAttn, self).__init__()
+        self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
+        self.C, self.D = embed_dim, cond_dim
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.attn = CrossAttention(block_idx=block_idx, in_dim=embed_dim, embed_dim=embed_dim, num_heads=num_heads, attn_drop=attn_drop,
+                                  proj_drop=drop, attn_l2_norm=attn_l2_norm, flash_if_available=flash_if_available)
+        self.ffn = FFN(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio), drop=drop,
+                       fused_if_available=fused_if_available)
+
+        self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
+        self.shared_aln = shared_aln
+        self.add_cond = add_cond
+        if self.add_cond:
+            if self.shared_aln:
+                self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim ** 0.5)
+            else:
+                lin = nn.Linear(cond_dim, 6 * embed_dim)
+                self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
+
+        self.fused_add_norm_fn = None
+
+    # NOTE: attn_bias is None during inference because kv cache is enabled
+    def forward(self, x, y, cond_BD, attn_bias):  # C: embed_dim, D: cond_dim
+        if self.add_cond:
+            assert cond_BD is not None
+            if self.shared_aln:
+                gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(
+                    2)  # 116C + B16C =unbind(2)=> 6 B1C
+            else:
+                gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
+            x = x + self.drop_path(
+                self.attn(self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), self.ln_wo_grad(y), attn_bias=attn_bias).mul_(gamma1))
+            x = x + self.drop_path(self.ffn(self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2)).mul(
+                gamma2))  # this mul(gamma2) cannot be in-placed when FusedMLP is used
+        else:
+            x = x + self.drop_path(self.attn(self.ln_wo_grad(x), self.ln_wo_grad(y), attn_bias=attn_bias))
+            x = x + self.drop_path(self.ffn(self.ln_wo_grad(x)))
+        return x
+
+    def extra_repr(self) -> str:
+        return f'shared_aln={self.shared_aln}'
 
 class AdaLNBeforeHead(nn.Module):
     def __init__(self, C, D, norm_layer):   # C: embed_dim, D: cond_dim
@@ -183,40 +326,25 @@ class AdaLNBeforeHead(nn.Module):
         scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
         return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
 
+if __name__ == '__main__':
+    # h_lq = torch.randn(2, 32, 16, 16).flatten(2).permute(0, 2, 1)
+    h_lq = torch.randn(2, 680, 32)
+    h_hq = torch.randn(2, 680, 32)
+    attn_mask = torch.zeros(1, 1, 680, 680)
+    print(h_lq.shape, h_hq.shape, attn_mask.shape)
 
-class TransformerSALayer(nn.Module):
-    def __init__(self, embed_dim, nhead=8, dim_mlp=2048, dropout=0.0, activation="gelu"):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(embed_dim, nhead, dropout=dropout)
-        # Implementation of Feedforward model - MLP
-        self.linear1 = nn.Linear(embed_dim, dim_mlp)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_mlp, embed_dim)
+    # train
+    cross_attention = CrossAttention(
+        block_idx=0,
+        in_dim=32,
+        embed_dim=512,
+        num_heads=4,
+        attn_l2_norm=True,
+    )
+    # v = cross_attention(h_hq, h_lq, attn_mask).permute(0, 2, 1).reshape(-1, 32, 16, 16)
+    v = cross_attention(h_hq, h_lq, attn_mask)
+    print(v.shape)
 
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+    # inference
 
-        self.activation = F.gelu
-
-    def with_pos_embed(self, tensor, pos=None):
-        return tensor if pos is None else tensor + pos
-
-    def forward(self, tgt,
-                tgt_mask= None,
-                tgt_key_padding_mask = None,
-                query_pos = None):
-        # self attention
-        tgt2 = self.norm1(tgt)
-        q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout1(tgt2)
-
-        # ffn
-        tgt2 = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout2(tgt2)
-        return tgt
 

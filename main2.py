@@ -98,9 +98,9 @@ def build_everything(args: arg_util.Args):
     print(f'[build PT data] ...\n')
     train_params, val_params = build_transforms_params(args)
     train_params['use_hflip'] = args.hflip
-    train_params['identify_ratio'] = 0.01
+    train_params['identify_ratio'] = 0  # 0.005
     val_params['use_hflip'] = args.hflip
-    val_params['identify_ratio'] = 0.1
+    val_params['identify_ratio'] = 0  # 0.05
     ld_train = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=train_params, split='train')
     ld_val = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=val_params, split='val')
 

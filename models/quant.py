@@ -206,7 +206,7 @@ class VectorQuantizer2(nn.Module):
         for si in range(SN):
             pn = self.v_patch_nums[si]
             next_scales.append(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn).view(B, C, -1).transpose(1, 2))
-        return next_scales[0].squeeze(1) , torch.cat(next_scales[1:], dim=1) if len(next_scales) else None  # cat BlCs to BLC, this should be float32
+        return next_scales[0].squeeze(1), torch.cat(next_scales, dim=1) if len(next_scales) else None  # cat BlCs to BLC, this should be float32
 
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
@@ -220,6 +220,16 @@ class VectorQuantizer2(nn.Module):
             f_hat.add_(h)
             return f_hat, f_hat
 
+    def get_next_autoregressive_input2(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
+        HW = self.v_patch_nums[-1]
+        if si != SN-1:
+            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # conv after upsample
+            f_hat.add_(h)
+            return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
+        else:
+            h = self.quant_resi[si/(SN-1)](h_BChw)
+            f_hat.add_(h)
+            return f_hat, f_hat
 
 class Phi(nn.Conv2d):
     def __init__(self, embed_dim, quant_resi):

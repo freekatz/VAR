@@ -58,17 +58,17 @@ class VAR2Trainer(object):
         stt = time.time()
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
-        for inp_B3HW, label_B in ld_val:
-            B, V = label_B.shape[0], self.vae_local.vocab_size
-            inp_B3HW = inp_B3HW.to(dist_utils.get_device(), non_blocking=True)
-            label_B = label_B.to(dist_utils.get_device(), non_blocking=True)
+        for lq, hq in ld_val:
+            B, V = lq.shape[0], self.vae_local.vocab_size
+            lq = lq.to(dist_utils.get_device(), non_blocking=True)
+            hq = hq.to(dist_utils.get_device(), non_blocking=True)
 
-            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(hq)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
-            # x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            x_BLCv_wo_first_l = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
 
             self.var_wo_ddp.forward
-            logits_BLV = self.var_wo_ddp(label_B)
+            logits_BLV = self.var_wo_ddp(lq, x_BLCv_wo_first_l)
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V),
                                     gt_BL[:, -self.last_l:].reshape(-1)) * B
@@ -106,11 +106,11 @@ class VAR2Trainer(object):
 
         gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(hq)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)
-        # x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        x_BLCv_wo_first_l = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
 
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            logits_BLV = self.var(lq)
+            logits_BLV = self.var(lq, x_BLCv_wo_first_l)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             if prog_si >= 0:  # in progressive training
                 bg, ed = self.begin_ends[prog_si]
