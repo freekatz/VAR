@@ -181,27 +181,35 @@ class VAR2Trainer(object):
         return state
 
     def load_state_dict(self, state, strict=True, skip_vae=False):
-        for k in ('var_wo_ddp', 'vae_local', 'var_opt'):
+        if len(state) == 1:
+            ks = {'var_wo_ddp'}
+        else:
+            ks = ('var_wo_ddp', 'vae_local', 'var_opt')
+        for k in ks:
             if skip_vae and 'vae' in k: continue
             m = getattr(self, k)
             if m is not None:
                 if hasattr(m, '_orig_mod'):
                     m = m._orig_mod
-                ret = m.load_state_dict(state[k], strict=strict)
+                if k == 'var_wo_ddp':
+                    ret = m.load_state_dict(state[k], strict=False, compat=True)
+                else:
+                    ret = m.load_state_dict(state[k], strict=strict)
                 if ret is not None:
                     missing, unexpected = ret
                     print(f'[VARTrainer.load_state_dict] {k} missing:  {missing}')
                     print(f'[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}')
 
         config: dict = state.pop('config', None)
-        self.prog_it = config.get('prog_it', 0)
-        self.last_prog_si = config.get('last_prog_si', -1)
-        self.first_prog = config.get('first_prog', True)
         if config is not None:
-            for k, v in self.get_config().items():
-                if config.get(k, None) != v:
-                    err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
-                    if strict:
-                        raise AttributeError(err)
-                    else:
-                        print(err)
+            self.prog_it = config.get('prog_it', 0)
+            self.last_prog_si = config.get('last_prog_si', -1)
+            self.first_prog = config.get('first_prog', True)
+            if config is not None:
+                for k, v in self.get_config().items():
+                    if config.get(k, None) != v:
+                        err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
+                        if strict:
+                            raise AttributeError(err)
+                        else:
+                            print(err)

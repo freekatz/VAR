@@ -27,6 +27,7 @@ class Args(Tap):
     resume: str = ''            # if specified, load this checkpoint; if not, load the latest checkpoint in bed (if existing)
     data_path: str = 'dataset_link' # datasets, split by - or _, o: openimages, cc: cc12m, co: coco, fa: face data(ffhq+HumanArt+afhq+Internal), mj: midjourney, p: pinterest, px: (pexels+pixabay+unsplash)
     dataset_name: str = 'ffhq_blind'
+    pretrain: str = ''
     vae_path: str = ''
 
     # VAE

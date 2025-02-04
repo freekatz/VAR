@@ -10,7 +10,6 @@ from utils import dist_utils
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
-from utils.my_dataset import FFHQBlind
 
 
 class SharedAdaLin(nn.Linear):
@@ -250,8 +249,10 @@ class VAR(nn.Module):
         attn_bias = attn_bias.to(dtype=main_type)
 
         AdaLNSelfAttn.forward
+        print(cond_BD_or_gss.shape)
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        print(x_BLC.shape)
         # x_BLC torch.Size([1, 680, 1024])
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
@@ -384,92 +385,4 @@ if __name__ == '__main__':
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     )
 
-    var_wo_ddp.load_state_dict(torch.load('../var_d16.pth', map_location='cpu'))
-
-    import PIL.Image as PImage
-    from torchvision.transforms import InterpolationMode, transforms
-    import torch
-
-    from utils.my_transforms import BlindTransform, NormTransform
-
-
-    def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
-        B, C, H, W = img_tensor.shape
-        assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
-        b = int(math.sqrt(B))
-        img_tensor = torch.permute(img_tensor, (1, 0, 2, 3))
-        img_tensor = torch.reshape(img_tensor, (C, b, b * H, W))
-        img_tensor = torch.permute(img_tensor, (0, 2, 1, 3))
-        img_tensor = torch.reshape(img_tensor, (C, b * H, b * W))
-        img = transforms.ToPILImage()(img_tensor)
-        return img
-
-
-    opt = {
-        'blur_kernel_size': 41,
-        'kernel_list': ['iso', 'aniso'],
-        'kernel_prob': [0.5, 0.5],
-        'blur_sigma': [1, 15],
-        'downsample_range': [4, 30],
-        'noise_range': [0, 1],
-        'jpeg_range': [30, 80],
-        'use_hflip': True,
-    }
-    final_reso = 256
-    mid_reso = 1.125
-    # build augmentations
-    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
-    train_lq_aug = [
-        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
-        BlindTransform(opt),
-    ]
-    train_hq_aug = [
-        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
-        transforms.ToTensor(),
-    ]
-
-    train_lq_transform = transforms.Compose(train_lq_aug)
-    train_hq_transform = transforms.Compose(train_hq_aug)
-
-    transform_dict = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform}
-    ds = FFHQBlind(root='../tmp', split='train', **transform_dict)
-    idx = 0
-    lq, hq = ds[idx]
-    print(lq.shape, hq.shape)
-
-    img_lq = transforms.ToPILImage()(lq)
-    img_hq = transforms.ToPILImage()(hq)
-    img_lq.save('../out/lq.png')
-    img_hq.save('../out/hq.png')
-
-    label = torch.tensor([0] * 1, dtype=torch.long)
-    # hq = torch.randn((4, 3, 256, 256))
-    idx = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
-    inp = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx)
-    logits = var_wo_ddp(label, inp)
-    pred = torch.argmax(logits, dim=-1)
-    pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
-    img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
-    for i, im in enumerate(img):
-        pim = transforms.ToPILImage()(im.squeeze(0))
-        pim.save(f'../out/var-{i}.png')
-
-    # img = var_wo_ddp.autoregressive_infer_cfg(
-    #     4, label
-    # )
-    #
-    # import PIL.Image as PImage
-    # from torchvision.transforms import transforms
-    # def tensor_to_img(img_tensor: torch.Tensor) -> PImage.Image:
-    #     B, C, H, W = img_tensor.shape
-    #     assert int(math.sqrt(B)) * int(math.sqrt(B)) == B
-    #     b = int(math.sqrt(B))
-    #     img_tensor = torch.permute(img_tensor, (1, 0, 2, 3))
-    #     img_tensor = torch.reshape(img_tensor, (C, b, b * H, W))
-    #     img_tensor = torch.permute(img_tensor, (0, 2, 1, 3))
-    #     img_tensor = torch.reshape(img_tensor, (C, b * H, b * W))
-    #     img = transforms.ToPILImage()(img_tensor)
-    #     return img
-    #
-    # pimg = tensor_to_img(img)
-    # pimg.show()
+    # var_wo_ddp.load_state_dict(torch.load('../var_d16.pth', map_location='cpu'))

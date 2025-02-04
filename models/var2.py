@@ -1,7 +1,10 @@
 import math
+from collections import OrderedDict
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Mapping, Any, Dict
 import sys, os
+
+from einops import repeat
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 
@@ -14,7 +17,6 @@ from utils import dist_utils
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, AdaLNCrossAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
-from utils.my_dataset import FFHQBlind
 
 
 class SharedAdaLin(nn.Linear):
@@ -44,13 +46,20 @@ class VAR2(nn.Module):
         self.prog_si = -1  # progressive training
 
         self.patch_nums: Tuple[int] = patch_nums
-        self.L = sum(pn ** 2 for pn in self.patch_nums)
-        self.first_l = self.patch_nums[0] ** 2
+        self.first_l = self.patch_nums[-1] ** 2
+        self.patch_hws = [pn*pn for pn in self.patch_nums]
+        self.patch_hws[0] = self.first_l
+        self.L = sum(self.patch_hws)
         self.begin_ends = []
         cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur + pn ** 2))
-            cur += pn ** 2
+        for i in range(len(self.patch_nums)):
+            if i == 0:
+                self.begin_ends.append((cur, self.first_l))
+                cur += self.first_l
+            else:
+                pn = self.patch_nums[i]
+                self.begin_ends.append((cur, cur + pn ** 2))
+                cur += pn ** 2
 
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist_utils.get_device())
@@ -62,20 +71,19 @@ class VAR2(nn.Module):
         self.word_embed = nn.Linear(self.Cvae, self.C)
 
         # 2. class embedding
-        init_std = math.sqrt(1 / self.C / 3)
-        # self.num_classes = num_classes
-        # self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
-        #                                device=dist_utils.get_device())
-        self.cond_embed = nn.Embedding(self.V, self.C)
-        nn.init.trunc_normal_(self.cond_embed.weight.data, mean=0, std=init_std)
-        self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
-        nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
+        self.cond_embed = nn.Linear(self.Cvae, self.C)
 
         # 3. absolute position embedding
+        init_std = math.sqrt(1 / self.C / 3)
         pos_1LC = []
-        for i, pn in enumerate(self.patch_nums):
-            pe = torch.empty(1, pn * pn, self.C)
-            nn.init.trunc_normal_(pe, mean=0, std=init_std)
+        for i in range(len(self.patch_nums)):
+            if i == 0:
+                pe = torch.empty(1, self.first_l, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
+            else:
+                pn = self.patch_nums[i]
+                pe = torch.empty(1, pn * pn, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
             pos_1LC.append(pe)
         pos_1LC = torch.cat(pos_1LC, dim=1)  # 1, L, C
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
@@ -85,20 +93,20 @@ class VAR2(nn.Module):
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
         # 4. backbone blocks
-        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
-                                            SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
+        # self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
+        #                                     SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [x.item() for x in
                torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
         self.blocks = nn.ModuleList([
-            AdaLNCrossAttn(
+            AdaLNSelfAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
                 last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
-                attn_l2_norm=attn_l2_norm,
+                attn_l2_norm=attn_l2_norm, add_cond=False,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
             )
             for block_idx in range(depth)
@@ -115,8 +123,7 @@ class VAR2(nn.Module):
 
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn * pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L,
-                                                                                                              1)
+        d: torch.Tensor = torch.cat([torch.full((pn,), i) for i, pn in enumerate(self.patch_hws)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)  # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
@@ -138,7 +145,7 @@ class VAR2(nn.Module):
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
-            self, lq: torch.FloatTensor,
+            self, lq: torch.Tensor,
             g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
             more_smooth=False,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
@@ -148,33 +155,33 @@ class VAR2(nn.Module):
             self.rng.manual_seed(g_seed); rng = self.rng
         B = lq.shape[0]
 
-        idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-        cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-        x_BLC_lq = self.word_embed(x_BLCv_lq.float())
-        x_BLC_lq = torch.split(x_BLC_lq, [ph * pw for (ph, pw) in self.vae_proxy[0].patch_hws], dim=1)
-
-        sos = cond_BD = self.cond_embed(cond.squeeze(-1))
+        cond = self.vae_proxy[0].img_to_f(lq).reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        sos = self.cond_embed(cond)
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        pos_start = self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        next_token_map_hq = sos.unsqueeze(1).expand(B, self.first_l, -1) + pos_start
+        sos = repeat(sos, 'b l c -> a b l c', a=2, b=B, l=self.first_l, c=sos.shape[-1])
+        next_token_map = sos.reshape(2*B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
-            next_token_map_lq = x_BLC_lq[si]
-
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
-            cur_L += pn * pn
+            if si == 0:
+                cur_L += self.first_l
+            else:
+                cur_L += self.patch_hws[si]
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map_hq
-            y = next_token_map_lq
+            x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, y=y, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(y, cond_BD)
+                x = b(x=x, cond_BD=None, attn_bias=None)
+            if si == 0:
+                x = x[:, self.first_l-1:]
+            logits_BlV = self.get_logits(x, cond_BD=None)
+
+            t = cfg * ratio
+            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
 
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
@@ -185,51 +192,53 @@ class VAR2(nn.Module):
                          self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
 
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map_hq = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums),
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums),
                                                                                           f_hat, h_BChw)
             if si != self.num_stages_minus_1:  # prepare for next stage
-                next_token_map_hq = next_token_map_hq.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map_hq = self.word_embed(next_token_map_hq) + lvl_pos[:,
-                                                                   cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = self.word_embed(next_token_map)
+                next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                next_token_map = next_token_map.repeat(2, 1, 1)  # double the batch sizes due to CFG
+
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
 
-    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l_hq: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
-        B = lq.shape[0]
+        B = x_BLCv_wo_first_l.shape[0]
+        cond = self.vae_proxy[0].img_to_f(lq).reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            idx_lq = self.vae_proxy[0].img_to_idxBl(lq)
-            cond, x_BLCv_lq = self.vae_quant_proxy[0].idxBl_to_var2_input(idx_lq)
-            sos = cond_BD = self.cond_embed(cond.squeeze(-1))
-            sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
-
+            sos = self.cond_embed(cond)
             if self.prog_si == 0:
-                x_BLC_lq = sos
-                x_BLC_hq = sos
+                x_BLC = sos
             else:
-                x_BLC_lq = self.word_embed(x_BLCv_lq.float())
-                x_BLC_hq = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l_hq.float())), dim=1)
-            # x_BLC_lq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-            x_BLC_hq += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         # hack: get the dtype if mixed precision is used
-        temp = x_BLC_hq.new_ones(8, 8)
+        temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
 
-        x_BLC_lq = x_BLC_lq.to(dtype=main_type)
-        x_BLC_hq = x_BLC_hq.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
+        x_BLC = x_BLC.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
-        AdaLNCrossAttn.forward
+        AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC_hq = b(x=x_BLC_hq, y=x_BLC_lq, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        # x_BLC torch.Size([1, 680, 1024])
-        x_BLC_hq = self.get_logits(x_BLC_hq.float(), cond_BD)
-        return x_BLC_hq  # logits BLV, V is vocab_size
+            x_BLC = b(x=x_BLC, cond_BD=None, attn_bias=attn_bias)
+        x_BLC = x_BLC[:, self.first_l-1:]
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=None)
+
+        if self.prog_si == 0:
+            if isinstance(self.word_embed, nn.Linear):
+                x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
+            else:
+                s = 0
+                for p in self.word_embed.parameters():
+                    if p.requires_grad:
+                        s += p.view(-1)[0] * 0
+                x_BLC[0, 0, 0] += s
+        return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
@@ -292,10 +301,84 @@ class VAR2(nn.Module):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 
+    def load_state_dict(self, state_dict: Dict[str, Any],
+                        strict: bool = True, assign: bool = False, compat=False):
+
+        if compat:
+            strict = False
+        if compat:
+            # compat encoder and decoder
+            new_state_dict = OrderedDict()
+            for key in list(state_dict.keys()):
+                if key.find('pos_1LC') != -1:
+                    pass
+                elif key.find('lvl_1L') != -1:
+                    pass
+                elif key.find('attn_bias_for_masking') != -1:
+                    pass
+                else:
+                    new_state_dict[key] = state_dict.pop(key)
+        else:
+            new_state_dict = state_dict
+        return super().load_state_dict(state_dict=new_state_dict, strict=strict, assign=assign)
+
+
 if __name__ == '__main__':
-    import sys
+    import argparse
+    import glob
+    import math
+
+    import PIL.Image as PImage
+    import torch
+
+    from utils import dist_utils
+    from utils.dataset.options import DataOptions
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--mode', type=int, default=0)
+    parser.add_argument('--data', type=str, default='')
+    parser.add_argument('--ckpt', type=str, default='')
+    parser.add_argument('--out', type=str, default='res')
+    parser.add_argument('--opts', type=str, default='{}')
+    args = parser.parse_args()
 
     device = 'cpu'
+    seed = args.seed
+    import random
+
+    def seed_everything(self):
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        if self.seed is not None:
+            print(f'[in seed_everything] {self.deterministic=}', flush=True)
+            if self.deterministic:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                torch.use_deterministic_algorithms(True)
+                os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+            seed = self.seed + dist_utils.get_rank() * 16384
+            os.environ['PYTHONHASHSEED'] = str(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            self.same_seed_for_all_ranks = seed
+
+
+    def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
+        return x.add(x).add_(-1)
+
+
+    def denormalize_pm1_into_01(x):  # normalize x from [-1, 1] to [0, 1] by (x + 1)/2
+        return x.add(1) / 2
+
+    import sys
+    from pathlib import Path
+    import os
+    root = Path(os.path.dirname(__file__)).parent
 
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     # VQVAE args
@@ -312,7 +395,6 @@ if __name__ == '__main__':
     init_adaln_gamma = 1e-5
     init_head = 0.02
     init_std = -1
-
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums)
 
@@ -330,116 +412,97 @@ if __name__ == '__main__':
     )
     vae_local.eval()
     var_wo_ddp.eval()
-
-    data_root =  sys.argv[1]
-    arg_idx = 2
-    if len(sys.argv) > arg_idx:
-        var_ckpt = sys.argv[arg_idx]
-        var_ckpt = torch.load(var_ckpt, map_location='cpu')
+    if args.ckpt != '':
+        var_ckpt = torch.load(args.ckpt, map_location='cpu')
         vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
+        var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=False, compat=False)
 
-        print(var_ckpt['trainer'].keys())
-        var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=False)
-        arg_idx+=1
+    from utils.dataset.ffhq_blind import FFHQBlind
+    import torchvision
+    import numpy as np
 
+    # validate
+    from pprint import pprint
+    opt = DataOptions.val_options()
+    pprint(opt)
+
+    import json
+    arg_opts = json.loads(args.opts)
+    for k, v in arg_opts.items():
+        print(f'Option updates: {k} {opt[k]} -> {k} {v}')
+        opt[k] = v
+
+    import torch.utils.data as data
     import PIL.Image as PImage
-    from torchvision.transforms import InterpolationMode, transforms
-    import torch
 
-    from utils.my_transforms import BlindTransform, NormTransform, denormalize_pm1_into_01
+    def inference(i, ds: data.Dataset):
+        lq_in_list = []
+        hq_in_list = []
+        for idx in range(len(ds)):
+            if idx > 20:
+                break
+            res = ds[idx]
+            lq, hq = res['lq'], res['gt']
+            lq_in_list.append(lq)
+            hq_in_list.append(hq)
+        lq = torch.stack(lq_in_list, dim=0)
+        hq = torch.stack(hq_in_list, dim=0)
+        print(i, lq.shape, hq.shape)
 
-    opt = {
-        'blur_kernel_size': 41,
-        'kernel_list': ['iso', 'aniso'],
-        'kernel_prob': [0.5, 0.5],
-        'blur_sigma': [1, 15],
-        'downsample_range': [4, 30],
-        'noise_range': [0, 20],
-        'jpeg_range': [30, 80],
-        # 'color_jitter_prob': 0.3,
-        # 'color_jitter_shift': 20,
-        # 'color_jitter_pt_prob': 0.3,
-        # 'gray_prob': 0.01,
-    }
-    final_reso = 256
-    mid_reso = 1.125
-    # build augmentations
-    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
-    train_lq_aug = [
-        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
-        BlindTransform(opt),
-        NormTransform()
-    ]
-    train_hq_aug = [
-        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
-        transforms.ToTensor(),
-        NormTransform()
-    ]
+        lq_res = var_wo_ddp.autoregressive_infer_cfg(lq)
+        hq_res = var_wo_ddp.autoregressive_infer_cfg(hq)
 
-    train_lq_transform = transforms.Compose(train_lq_aug)
-    train_hq_transform = transforms.Compose(train_hq_aug)
-
-    params = {'lq_transform': train_lq_transform, 'hq_transform': train_hq_transform, 'use_hflip': True}
-    ds = FFHQBlind(root=data_root, split='train', **params)
-    data_idx = 0
-    if len(sys.argv) > arg_idx:
-        data_idx = int(sys.argv[arg_idx])
-        arg_idx+=1
-    lq, hq = ds[data_idx]
-    print(lq.shape, hq.shape)
-
-    from pathlib import Path
-    out_path = Path('../out')
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    img_lq = transforms.ToPILImage()(denormalize_pm1_into_01(lq))
-    img_hq = transforms.ToPILImage()(denormalize_pm1_into_01(hq))
-    img_lq.save('../out/lq.png')
-    img_hq.save('../out/hq.png')
-
-    swap = False
-    if len(sys.argv) > arg_idx:
-        swap = True
-        arg_idx += 1
-    inference = False
-    if len(sys.argv) > arg_idx:
-        inference = True
-        arg_idx += 1
-
-    x_BLCv_wo_first_l = None
-    if inference:
-        img = [var_wo_ddp.autoregressive_infer_cfg(lq.unsqueeze(0))]
-    else:
-        idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq.unsqueeze(0))
-        idx_lq = var_wo_ddp.vae_proxy[0].img_to_idxBl(lq.unsqueeze(0))
-        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_hq)
-        logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
-        pred = torch.argmax(logits, dim=-1)
-        pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
-        img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
-    img.insert(0, lq.unsqueeze(0))
-    img.insert(0, hq.unsqueeze(0))
-    img = torch.cat(img, dim=0)
-    img = denormalize_pm1_into_01(img)
-    chw = torchvision.utils.make_grid(img, nrow=3, padding=0, pad_value=1.0)
-    chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
-    chw = PImage.fromarray(chw.astype(np.uint8))
-    chw.save(f'../out/{data_idx}-lq-res.png')
-
-    if swap:
-        lq = hq
-        if inference:
-            img = [var_wo_ddp.autoregressive_infer_cfg(lq.unsqueeze(0))]
-        else:
-            logits = var_wo_ddp(lq.unsqueeze(0), x_BLCv_wo_first_l)
-            pred = torch.argmax(logits, dim=-1)
-            pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
-            img = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)
-        img.insert(0, lq.unsqueeze(0))
-        img.insert(0, hq.unsqueeze(0))
-        img = torch.cat(img, dim=0)
-        img = denormalize_pm1_into_01(img)
-        chw = torchvision.utils.make_grid(img, nrow=3, padding=0, pad_value=1.0)
+        res = [hq, lq, hq_res, lq_res]
+        res_img = torch.stack(res, dim=1)
+        res_img = torch.reshape(res_img, (-1, 3, 256, 256))
+        img = denormalize_pm1_into_01(res_img)
+        chw = torchvision.utils.make_grid(img, nrow=len(res), padding=0, pad_value=1.0)
         chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
         chw = PImage.fromarray(chw.astype(np.uint8))
-        chw.save(f'../out/{data_idx}-hq-res.png')
+        filename = f'dataset{i}-{args.out}.png'
+        chw.save(os.path.join(root, filename))
+        print(f'Saved {filename}...')
+
+    def inference2(i, ds: data.Dataset):
+        lq_in_list = []
+        hq_in_list = []
+        for idx in range(len(ds)):
+            if idx > 20:
+                break
+            res = ds[idx]
+            lq, hq = res['lq'], res['gt']
+            lq_in_list.append(lq)
+            hq_in_list.append(hq)
+        lq = torch.stack(lq_in_list, dim=0)
+        hq = torch.stack(hq_in_list, dim=0)
+        print(i, lq.shape, hq.shape)
+
+        idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq)
+        x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_hq)
+        logits = var_wo_ddp(lq, x_BLCv_wo_first_l)
+        pred = torch.argmax(logits, dim=-1)
+        pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+        lq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
+
+        logits = var_wo_ddp(hq, x_BLCv_wo_first_l)
+        pred = torch.argmax(logits, dim=-1)
+        pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
+        hq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
+
+        res = [hq, lq, hq_res, lq_res]
+        res_img = torch.stack(res, dim=1)
+        res_img = torch.reshape(res_img, (-1, 3, 256, 256))
+        img = denormalize_pm1_into_01(res_img)
+        chw = torchvision.utils.make_grid(img, nrow=len(res), padding=0, pad_value=1.0)
+        chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
+        chw = PImage.fromarray(chw.astype(np.uint8))
+        filename = f'dataset{i}-{args.out}-mode{args.mode}.png'
+        chw.save(os.path.join(root, filename))
+        print(f'Saved {filename}...')
+
+    for i in range(4):
+        ds = FFHQBlind(root=f'{args.data}{i+1}', split='train', opt=opt)
+        if args.mode == 0:
+            inference(i + 1, ds)
+        elif args.mode == 1:
+            inference2(i + 1, ds)

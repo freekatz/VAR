@@ -10,8 +10,9 @@ import torch
 
 from utils import dist_utils
 from utils import arg_util, misc
-from utils.data import build_data_loader, build_transforms_params
-from utils.misc import maybe_resume
+from utils.data import build_data_loader
+from utils.dataset.options import DataOptions
+from utils.misc import maybe_resume, maybe_pretrain
 
 
 def build_tensorboard_logger(args: arg_util.Args):
@@ -87,22 +88,23 @@ def build_optimizer(args: arg_util.Args, var_wo_ddp):
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = maybe_resume(args)
+    if len(trainer_state) == 0:
+        trainer_state = maybe_pretrain(args)
     # create tensorboard logger
     tb_lg = build_tensorboard_logger(args)
     
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
-    
+
     # build data
     print(f'[build PT data] ...\n')
-    train_params, val_params = build_transforms_params(args)
-    train_params['use_hflip'] = args.hflip
-    train_params['identify_ratio'] = 0  # 0.005
-    val_params['use_hflip'] = args.hflip
-    val_params['identify_ratio'] = 0  # 0.05
-    ld_train = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=train_params, split='train')
-    ld_val = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=val_params, split='val')
+    train_opt = DataOptions.train_options()
+    ld_train = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params={'opt': train_opt},
+                                 split='train')
+    val_opt = DataOptions.val_options()
+    ld_val = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params={'opt': val_opt},
+                                 split='val')
 
     [print(line) for line in auto_resume_info]
     print(f'[dataloader multi processing] ...', end='', flush=True)
@@ -263,7 +265,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         )
         profiler.start()
 
-    for it, (lq, hq) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    for it, data in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
         g_it = ep * iters_train + it
         if it < start_it: continue
         if is_first_ep and it == start_it: warnings.resetwarnings()
@@ -271,6 +273,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         if doing_profiling:
             profiler.step()
 
+        lq, hq = data['lq'], data['gt']
         lq = lq.to(args.device, non_blocking=True)
         hq = hq.to(args.device, non_blocking=True)
         

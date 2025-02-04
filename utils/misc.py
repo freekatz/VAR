@@ -358,6 +358,25 @@ def maybe_resume(args: arg_util.Args) -> Tuple[List[str], int, int, dict, dict]:
     return info, ep, it, ckpt['trainer'], ckpt['args']
 
 
+def maybe_pretrain(args: arg_util.Args):
+    info = []
+    pretrain = args.pretrain
+    if pretrain is None or pretrain == '':
+        return {}
+    try:
+        ckpt = torch.load(pretrain, map_location='cpu')
+    except Exception as e:
+        info.append(f'[pretrain] failed, {e} @ {pretrain}')
+        return info, 0, 0, {}, {}
+
+    dist_utils.barrier()
+    trainer_state = {
+        'var_wo_ddp': ckpt,
+    }
+    print(f'[pretrain] load success @ {pretrain}')
+    return trainer_state
+
+
 def create_npz_from_sample_folder(sample_folder: str):
     """
     Builds a single .npz file from a folder of .png samples. Refer to DiT.
