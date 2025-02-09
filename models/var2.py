@@ -70,8 +70,8 @@ class VAR2(nn.Module):
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
 
-        # 2. class embedding
-        self.cond_embed = nn.Linear(self.Cvae, self.C)
+        # # 2. class embedding
+        # self.cond_embed = nn.Linear(self.Cvae, self.C)
 
         # 3. absolute position embedding
         init_std = math.sqrt(1 / self.C / 3)
@@ -156,10 +156,10 @@ class VAR2(nn.Module):
         B = lq.shape[0]
 
         cond = self.vae_proxy[0].img_to_f(lq).reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
-        sos = self.cond_embed(cond)
+        with torch.cuda.amp.autocast(enabled=False):
+            sos = self.word_embed(cond)
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        sos = repeat(sos, 'b l c -> a b l c', a=2, b=B, l=self.first_l, c=sos.shape[-1])
-        next_token_map = sos.reshape(2*B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
@@ -176,13 +176,9 @@ class VAR2(nn.Module):
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=None, attn_bias=None)
-            if si == 0:
-                x = x[:, self.first_l-1:]
             logits_BlV = self.get_logits(x, cond_BD=None)
-
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-
+            if si == 0:
+                logits_BlV = logits_BlV[:, self.first_l-1:]
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -198,7 +194,6 @@ class VAR2(nn.Module):
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map)
                 next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)  # double the batch sizes due to CFG
 
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
@@ -208,7 +203,7 @@ class VAR2(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
         cond = self.vae_proxy[0].img_to_f(lq).reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
+            sos = self.word_embed(cond)
             if self.prog_si == 0:
                 x_BLC = sos
             else:
@@ -226,8 +221,8 @@ class VAR2(nn.Module):
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=None, attn_bias=attn_bias)
-        x_BLC = x_BLC[:, self.first_l-1:]
         x_BLC = self.get_logits(x_BLC.float(), cond_BD=None)
+        x_BLC = x_BLC[:, self.first_l-1:]
 
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
@@ -459,7 +454,7 @@ if __name__ == '__main__':
         chw = torchvision.utils.make_grid(img, nrow=len(res), padding=0, pad_value=1.0)
         chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
         chw = PImage.fromarray(chw.astype(np.uint8))
-        filename = f'dataset{i}-{args.out}.png'
+        filename = f'dataset{i}-{args.out}-mode{args.mode}.png'
         chw.save(os.path.join(root, filename))
         print(f'Saved {filename}...')
 

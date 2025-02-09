@@ -46,6 +46,7 @@ def build_vae_var(
 
 
 def build_vae_var2(
+        args,
         # Shared args
         device, patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),  # 10 steps by default
         # VQVAE args
@@ -76,7 +77,8 @@ def build_vae_var2(
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     ).to(device)
-    var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
+    if args.pretrain is None or args.pretrain == '':
+        var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
                             init_std=init_std)
 
     return vae_local, var_wo_ddp

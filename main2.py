@@ -37,6 +37,7 @@ def build_model(args):
     from models import VAR2, VQVAE, build_vae_var2
 
     vae_local, var_wo_ddp = build_vae_var2(
+        args=args,
         V=4096, Cvae=32, ch=160, share_quant_resi=4,  # hard-coded VQVAE hyperparameters
         device=dist_utils.get_device(), patch_nums=args.patch_nums,
         depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
