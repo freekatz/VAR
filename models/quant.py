@@ -180,7 +180,7 @@ class VectorQuantizer2(nn.Module):
         return f_hat_or_idx_Bl
     
     # ===================== idxBl_to_var_input: only used in VAR training, for getting teacher-forcing input =====================
-    def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+    def idxBl_to_var_input(self, gt_ms_idx_Bl: List[torch.Tensor], cat=True):
         next_scales = []
         B = gt_ms_idx_Bl[0].shape[0]
         C = self.Cvae
@@ -195,23 +195,48 @@ class VectorQuantizer2(nn.Module):
             f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
             pn_next = self.v_patch_nums[si+1]
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
-        return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
+        if cat:
+            return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
+        else:
+            return next_scales if len(next_scales) else None
 
-    def idxBl_to_var2_input(self, gt_ms_idx_Bl: List[torch.Tensor]) -> (torch.Tensor, torch.Tensor):
-        scales = []
-        B = gt_ms_idx_Bl[0].shape[0]
-        C = self.Cvae
-        H = W = self.v_patch_nums[-1]
-        SN = len(self.v_patch_nums)
+    def f_to_var2_input(self, f_BChw: torch.Tensor, v_patch_nums=None) -> (torch.Tensor, torch.Tensor):
+        B, C, H, W = f_BChw.shape
+        f_no_grad = f_BChw.detach()
+        f_rest = f_no_grad.clone()
+        f_hat = torch.zeros_like(f_rest)
 
-        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
-        for si in range(SN):
-            pn = self.v_patch_nums[si]
-            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
-            h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn, pn), size=(H, W), mode='bicubic')
-            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
-            scales.append(F.interpolate(f_hat, size=(pn, pn), mode='area').view(B, C, -1).transpose(1, 2))
-        return gt_ms_idx_Bl[0], torch.cat(scales, dim=1) if len(scales) else None  # cat BlCs to BLC, this should be float32
+        hs: List[torch.Tensor] = []
+
+        patch_hws = [(pn, pn) if isinstance(pn, int) else (pn[0], pn[1]) for pn in
+                     (v_patch_nums or self.v_patch_nums)]  # from small to large
+        assert patch_hws[-1][0] == H and patch_hws[-1][1] == W, f'{patch_hws[-1]=} != ({H=}, {W=})'
+
+        SN = len(patch_hws)
+        for si, (ph, pw) in enumerate(patch_hws):  # from small to large
+            if 0 <= self.prog_si < si: break  # progressive training: not supported yet, prog_si always -1
+            # find the nearest embedding
+            z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (
+                        si != SN - 1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
+            if self.using_znorm:
+                z_NC = F.normalize(z_NC, dim=-1)
+                idx_N = torch.argmax(z_NC @ F.normalize(self.embedding.weight.data.T, dim=0), dim=1)
+            else:
+                d_no_grad = torch.sum(z_NC.square(), dim=1, keepdim=True) + torch.sum(
+                    self.embedding.weight.data.square(), dim=1, keepdim=False)
+                d_no_grad.addmm_(z_NC, self.embedding.weight.data.T, alpha=-2, beta=1)  # (B*h*w, vocab_size)
+                idx_N = torch.argmin(d_no_grad, dim=1)
+
+            idx_Bhw = idx_N.view(B, ph, pw)
+            h = self.embedding(idx_Bhw)
+            h_BChw = F.interpolate(h.permute(0, 3, 1, 2), size=(H, W),
+                                   mode='bicubic').contiguous() if (si != SN - 1) else self.embedding(idx_Bhw).permute(
+                0, 3, 1, 2).contiguous()
+            h_BChw = self.quant_resi[si / (SN - 1)](h_BChw)
+            f_hat.add_(h_BChw)
+            f_rest.sub_(h_BChw)
+            hs.append(h.reshape(B, ph*pw, -1))
+        return hs
 
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference

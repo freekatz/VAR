@@ -71,15 +71,10 @@ class VAR2(nn.Module):
         self.word_embed = nn.Linear(self.Cvae, self.C)
 
         # 2. class embedding
-        init_std = math.sqrt(1 / self.C / 3)
-        num_classes = self.V
-        self.num_classes = num_classes
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
-        nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-
         self.cond_embed = nn.Linear(self.Cvae, self.C)
 
         # 3. absolute position embedding
+        init_std = math.sqrt(1 / self.C / 3)
         pos_1LC = []
         for i in range(len(self.patch_nums)):
             if i == 0:
@@ -98,8 +93,8 @@ class VAR2(nn.Module):
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
         # 4. backbone blocks
-        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
-                                            SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
+        # self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
+        #                                     SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
@@ -111,9 +106,14 @@ class VAR2(nn.Module):
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
                 last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
-                attn_l2_norm=attn_l2_norm, add_cond=True,
+                attn_l2_norm=attn_l2_norm, add_cond=False,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
             )
+            for block_idx in range(depth)
+        ])
+        # self.control_block = FeatureFusionBlock(self.C)
+        self.control_blocks = nn.ModuleList([
+            FeatureFusionBlock(self.C)
             for block_idx in range(depth)
         ])
 
@@ -164,10 +164,6 @@ class VAR2(nn.Module):
         cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
             sos = self.cond_embed(cond)
-        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False)[0]
-        c = self.class_emb(idx0)
-        c_gss = self.shared_ada_lin(c)
-
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
@@ -185,10 +181,10 @@ class VAR2(nn.Module):
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=c_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD=c_gss)
+                x = b(x=x, cond_BD=None, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD=None)
             if si == 0:
-                logits_BlV = logits_BlV.max(dim=1, keepdim=True)[0]
+                logits_BlV = logits_BlV[:, self.first_l-1:]
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -206,7 +202,7 @@ class VAR2(nn.Module):
                 next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
 
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
 
     def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
@@ -220,9 +216,6 @@ class VAR2(nn.Module):
             else:
                 x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False)[0]
-        c = self.class_emb(idx0)
-        c_gss = self.shared_ada_lin(c)
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
 
         # hack: get the dtype if mixed precision is used
@@ -234,8 +227,8 @@ class VAR2(nn.Module):
 
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD=c_gss)
+            x_BLC = b(x=x_BLC, cond_BD=None, attn_bias=attn_bias)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=None)
         x_BLC = x_BLC[:, self.first_l-1:]
 
         if self.prog_si == 0:
@@ -319,9 +312,11 @@ class VAR2(nn.Module):
             # compat encoder and decoder
             new_state_dict = OrderedDict()
             for key in list(state_dict.keys()):
+                if key.find('word_embed') != -1:
+                    param = state_dict[key]
+                    new_state_dict[key.replace('word_embed', 'cond_embed')] = param.clone()
+                    new_state_dict[key] = param
                 if key.find('pos_1LC') != -1:
-                    pass
-                elif key.find('class_emb') != -1:
                     pass
                 elif key.find('lvl_1L') != -1:
                     pass

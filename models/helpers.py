@@ -57,3 +57,10 @@ class DropPath(nn.Module):  # taken from timm
     
     def extra_repr(self):
         return f'(drop_prob=...)'
+
+
+if __name__ == '__main__':
+    logits_BlV = torch.randn(2, 32, 4096)
+    logits_BlV = logits_BlV.max(dim=1, keepdim=True)[0]
+    idx_Bl = sample_with_top_k_top_p_(logits_BlV, top_k=0, top_p=0, num_samples=1)[:, :, 0]
+    print(idx_Bl)

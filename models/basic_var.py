@@ -326,25 +326,108 @@ class AdaLNBeforeHead(nn.Module):
         scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
         return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
 
+
+class ResidualConvUnit(nn.Module):
+    """Residual convolution module.
+    """
+
+    def __init__(self, features):
+        """Init.
+
+        Args:
+            features (int): number of features
+        """
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            features, features, kernel_size=3, stride=1, padding=1, bias=True
+        )
+
+        self.conv2 = nn.Conv2d(
+            features, features, kernel_size=3, stride=1, padding=1, bias=True
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (tensor): input
+
+        Returns:
+            tensor: output
+        """
+        out = self.relu(x)
+        out = self.conv1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + x
+
+
+class FeatureFusionBlock(nn.Module):
+    """Feature fusion block.
+    """
+
+    def __init__(self, features, up=False):
+        """Init.
+
+        Args:
+            features (int): number of features
+        """
+        super(FeatureFusionBlock, self).__init__()
+
+        self.resConfUnit1 = ResidualConvUnit(features)
+        self.resConfUnit2 = ResidualConvUnit(features)
+        self.up = up
+
+    def forward(self, *xs):
+        """Forward pass.
+
+        Returns:
+            tensor: output
+        """
+        output = xs[0]
+
+        if len(xs) == 2:
+            output += self.resConfUnit1(xs[1])
+
+        output = self.resConfUnit2(output)
+
+        if self.up:
+            output = nn.functional.interpolate(
+                output, scale_factor=2, mode="bilinear", align_corners=True
+            )
+        return output
+
+
 if __name__ == '__main__':
-    # h_lq = torch.randn(2, 32, 16, 16).flatten(2).permute(0, 2, 1)
-    h_lq = torch.randn(2, 680, 32)
-    h_hq = torch.randn(2, 680, 32)
-    attn_mask = torch.zeros(1, 1, 680, 680)
-    print(h_lq.shape, h_hq.shape, attn_mask.shape)
+    # # h_lq = torch.randn(2, 32, 16, 16).flatten(2).permute(0, 2, 1)
+    # h_lq = torch.randn(2, 680, 32)
+    # h_hq = torch.randn(2, 680, 32)
+    # attn_mask = torch.zeros(1, 1, 680, 680)
+    # print(h_lq.shape, h_hq.shape, attn_mask.shape)
+    #
+    # # train
+    # cross_attention = CrossAttention(
+    #     block_idx=0,
+    #     in_dim=32,
+    #     embed_dim=512,
+    #     num_heads=4,
+    #     attn_l2_norm=True,
+    # )
+    # # v = cross_attention(h_hq, h_lq, attn_mask).permute(0, 2, 1).reshape(-1, 32, 16, 16)
+    # v = cross_attention(h_hq, h_lq, attn_mask)
+    # print(v.shape)
+    #
+    # # inference
 
-    # train
-    cross_attention = CrossAttention(
-        block_idx=0,
-        in_dim=32,
-        embed_dim=512,
-        num_heads=4,
-        attn_l2_norm=True,
-    )
-    # v = cross_attention(h_hq, h_lq, attn_mask).permute(0, 2, 1).reshape(-1, 32, 16, 16)
-    v = cross_attention(h_hq, h_lq, attn_mask)
-    print(v.shape)
-
-    # inference
+    model = FeatureFusionBlock(1024)
+    x = torch.randn(2, 680, 1024)
+    y = torch.randn(2, 680, 1024)
+    o = model(x.permute(2, 1, 0), y.permute(2, 1, 0))
+    o = o.permute(2, 1, 0)
+    print(o.shape)
 
 
