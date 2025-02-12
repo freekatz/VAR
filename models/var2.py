@@ -166,7 +166,6 @@ class VAR2(nn.Module):
             sos = self.cond_embed(cond)
         idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False)[0]
         c = self.class_emb(idx0)
-        c_gss = self.shared_ada_lin(c)
 
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
@@ -183,12 +182,13 @@ class VAR2(nn.Module):
                 cur_L += self.patch_hws[si]
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             x = next_token_map
+            c_gss = self.shared_ada_lin(c)
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=c_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD=c_gss)
+            logits_BlV = self.get_logits(x, cond_BD=c)
             if si == 0:
-                logits_BlV = logits_BlV.max(dim=1, keepdim=True)[0]
+                logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -235,9 +235,8 @@ class VAR2(nn.Module):
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD=c_gss)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=c)
         x_BLC = x_BLC[:, self.first_l-1:]
-
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
                 x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
@@ -312,6 +311,12 @@ class VAR2(nn.Module):
 
     def load_state_dict(self, state_dict: Dict[str, Any],
                         strict: bool = True, assign: bool = False, compat=False):
+        compat = True
+        for key in list(state_dict.keys()):
+            if key.find('cond_embed') != -1:
+                compat = False
+                strict = True
+                break
 
         if compat:
             strict = False

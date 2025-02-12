@@ -212,7 +212,6 @@ def main_training():
     print(f'  [*] [PT finished]  Total cost: {total_time},   Lm: {best_L_mean:.3f} ({L_mean}),   Lt: {best_L_tail:.3f} ({L_tail})')
     print('\n\n')
     
-    del stats
     del iters_train, ld_train
     time.sleep(3), gc.collect(), torch.cuda.empty_cache(), time.sleep(3)
     

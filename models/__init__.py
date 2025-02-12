@@ -77,7 +77,7 @@ def build_vae_var2(
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     ).to(device)
-    if args.pretrain is None or args.pretrain == '':
+    if (args.pretrain is None or args.pretrain == '') or (args.resume is None or args.resume == ''):
         var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
                             init_std=init_std)
 
