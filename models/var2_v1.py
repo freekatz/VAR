@@ -4,7 +4,6 @@ from functools import partial
 from typing import Optional, Tuple, Union, Mapping, Any, Dict
 import sys, os
 
-from einops import repeat
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 
@@ -71,10 +70,13 @@ class VAR2(nn.Module):
         self.word_embed = nn.Linear(self.Cvae, self.C)
 
         # 2. class embedding
-        self.cond_embed = nn.Linear(self.Cvae, self.C)
+        init_std = math.sqrt(1 / self.C / 3)
+        num_classes = self.V
+        self.num_classes = num_classes
+        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
 
         # 3. absolute position embedding
-        init_std = math.sqrt(1 / self.C / 3)
         pos_1LC = []
         for i in range(len(self.patch_nums)):
             if i == 0:
@@ -93,8 +95,8 @@ class VAR2(nn.Module):
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
         # 4. backbone blocks
-        # self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
-        #                                     SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
+        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
+                                            SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
@@ -106,14 +108,9 @@ class VAR2(nn.Module):
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
                 last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
-                attn_l2_norm=attn_l2_norm, add_cond=False,
+                attn_l2_norm=attn_l2_norm, add_cond=True,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
             )
-            for block_idx in range(depth)
-        ])
-        # self.control_block = FeatureFusionBlock(self.C)
-        self.control_blocks = nn.ModuleList([
-            FeatureFusionBlock(self.C)
             for block_idx in range(depth)
         ])
 
@@ -161,9 +158,12 @@ class VAR2(nn.Module):
         B = lq.shape[0]
 
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control_tokens = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
+            sos = self.word_embed(control_tokens)
+        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False)[0]
+        cond = self.class_emb(idx0)
+
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
@@ -179,12 +179,13 @@ class VAR2(nn.Module):
                 cur_L += self.patch_hws[si]
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             x = next_token_map
+            cond_BD = self.shared_ada_lin(cond)
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=None, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD=None)
+                x = b(x=x, cond_BD=cond_BD, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD=cond_BD)
             if si == 0:
-                logits_BlV = logits_BlV[:, self.first_l-1:]
+                logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -202,20 +203,23 @@ class VAR2(nn.Module):
                 next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
 
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
 
     def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control_tokens = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
+            sos = self.word_embed(control_tokens)
             if self.prog_si == 0:
                 x_BLC = sos
             else:
                 x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
+        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False)[0]
+        cond = self.class_emb(idx0)
+        cond_BD = self.shared_ada_lin(cond)
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
 
         # hack: get the dtype if mixed precision is used
@@ -227,10 +231,9 @@ class VAR2(nn.Module):
 
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=None, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD=None)
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD, attn_bias=attn_bias)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=cond_BD)
         x_BLC = x_BLC[:, self.first_l-1:]
-
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
                 x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
@@ -302,9 +305,14 @@ class VAR2(nn.Module):
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
-
     def load_state_dict(self, state_dict: Dict[str, Any],
                         strict: bool = True, assign: bool = False, compat=False):
+        compat = True
+        for key in list(state_dict.keys()):
+            if key.find('control_embed') != -1:
+                compat = False
+                strict = True
+                break
 
         if compat:
             strict = False
@@ -312,11 +320,11 @@ class VAR2(nn.Module):
             # compat encoder and decoder
             new_state_dict = OrderedDict()
             for key in list(state_dict.keys()):
-                if key.find('word_embed') != -1:
-                    param = state_dict[key]
-                    new_state_dict[key.replace('word_embed', 'cond_embed')] = param.clone()
-                    new_state_dict[key] = param
                 if key.find('pos_1LC') != -1:
+                    pass
+                elif key.find('class_emb') != -1:
+                    pass
+                elif key.find('pos_start') != -1:
                     pass
                 elif key.find('lvl_1L') != -1:
                     pass
@@ -384,6 +392,8 @@ if __name__ == '__main__':
     import sys
     from pathlib import Path
     import os
+    from pprint import pprint
+
     root = Path(os.path.dirname(__file__)).parent
 
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
@@ -420,15 +430,20 @@ if __name__ == '__main__':
     var_wo_ddp.eval()
     if args.ckpt != '':
         var_ckpt = torch.load(args.ckpt, map_location='cpu')
-        vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
-        var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=False, compat=False)
+        if 'trainer' in var_ckpt.keys():
+            vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
+            var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=True, compat=False)
+        else:
+            # vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
+            missing_keys, unexpected_keys = var_wo_ddp.load_state_dict(var_ckpt, strict=False, compat=True)
+            print('missing_keys: ', [k for k in missing_keys])
+            print('unexpected_keys: ', [k for k in unexpected_keys])
 
     from utils.dataset.ffhq_blind import FFHQBlind
     import torchvision
     import numpy as np
 
     # validate
-    from pprint import pprint
     opt = DataOptions.val_options()
     pprint(opt)
 

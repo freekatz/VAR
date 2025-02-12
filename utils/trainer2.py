@@ -69,7 +69,7 @@ class VAR2Trainer(object):
 
             self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(lq, x_BLCv_wo_first_l)
-            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
+            L_mean += self.val_loss(logits_BLV.data.reshape(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V),
                                     gt_BL[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100 / gt_BL.shape[1])
@@ -111,7 +111,7 @@ class VAR2Trainer(object):
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
             logits_BLV = self.var(lq, x_BLCv_wo_first_l)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+            loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.view(-1)).view(B, -1)
             if prog_si >= 0:  # in progressive training
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
@@ -127,7 +127,7 @@ class VAR2Trainer(object):
         # log
         pred_BL = logits_BLV.data.argmax(dim=-1)
         if it == 0 or it in metric_lg.log_iters:
-            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
+            Lmean = self.val_loss(logits_BLV.data.reshape(-1, V), gt_BL.view(-1)).item()
             acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
             if prog_si >= 0:  # in progressive training
                 Ltail = acc_tail = -1
