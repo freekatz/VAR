@@ -78,7 +78,7 @@ class VAR2(nn.Module):
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
 
-        self.cond_embed = nn.Linear(self.Cvae, self.C)
+        self.control_embed = nn.Linear(self.Cvae, self.C)
 
         # 3. absolute position embedding
         pos_1LC = []
@@ -119,7 +119,7 @@ class VAR2(nn.Module):
             )
             for block_idx in range(depth)
         ])
-        self.proj = nn.Linear(self.D, self.Cvae)
+        # self.proj = nn.Linear(self.D, self.Cvae)
 
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
@@ -165,16 +165,16 @@ class VAR2(nn.Module):
         B = lq.shape[0]
 
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
+            control_tokens = self.control_embed(control)
         idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
-        c = self.class_emb(idx0)
+        cond = self.class_emb(idx0)
 
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        next_token_map = control_tokens.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = control_tokens.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
@@ -184,11 +184,11 @@ class VAR2(nn.Module):
             else:
                 cur_L += self.patch_hws[si]
             x = next_token_map
-            c_gss = self.shared_ada_lin(c) if self.shared_aln else c
+            cond_gss = self.shared_ada_lin(cond) if self.shared_aln else cond
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=c_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD=c)
+                x = b(x=x, cond_BD=cond_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD=cond)
             if si == 0:
                 logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
@@ -214,13 +214,13 @@ class VAR2(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
+            control_tokens = self.control_embed(control)
             if self.prog_si == 0:
-                x_BLC = sos
+                x_BLC = control_tokens
             else:
-                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+                x_BLC = torch.cat((control_tokens, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
         idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
         c = self.class_emb(idx0)
@@ -237,10 +237,10 @@ class VAR2(nn.Module):
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
-        f = self.proj(x_BLC[:, :self.first_l]).permute(0, 2, 1).reshape(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        # f = self.proj(x_BLC[:, :self.first_l]).permute(0, 2, 1).reshape(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         x_BLC = self.get_logits(x_BLC.float(), cond_BD=c)
-        # x_BLC = x_BLC[:, self.first_l-1:]
-        return x_BLC, f  # logits BLV, V is vocab_size
+        x_BLC = x_BLC[:, self.first_l-1:]
+        return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
@@ -307,7 +307,7 @@ class VAR2(nn.Module):
                         strict: bool = True, assign: bool = False, compat=False):
         compat = True
         for key in list(state_dict.keys()):
-            if key.find('cond_embed') != -1:
+            if key.find('control_embed') != -1:
                 compat = False
                 strict = True
                 break
@@ -444,7 +444,7 @@ if __name__ == '__main__':
     import numpy as np
 
     # validate
-    opt = DataOptions.test_options()
+    opt = DataOptions.val_options()
     pprint(opt)
 
     import json
@@ -500,15 +500,15 @@ if __name__ == '__main__':
 
         idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq)
         x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_hq)
-        logits, _ = var_wo_ddp(lq, x_BLCv_wo_first_l)
+        logits = var_wo_ddp(lq, x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
-        pred = pred[:, var_wo_ddp.first_l-1:]
+        # pred = pred[:, var_wo_ddp.first_l-1:]
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
         lq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
 
-        logits, _ = var_wo_ddp(hq, x_BLCv_wo_first_l)
+        logits = var_wo_ddp(hq, x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
-        pred = pred[:, var_wo_ddp.first_l-1:]
+        # pred = pred[:, var_wo_ddp.first_l-1:]
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
         hq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
 

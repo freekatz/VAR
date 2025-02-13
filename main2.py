@@ -232,9 +232,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
     me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     [me.add_meter(x, misc.SmoothedValue(fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
-    [me.add_meter(x, misc.SmoothedValue(fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lf', 'Lmse']]
     [me.add_meter(x, misc.SmoothedValue(fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accm', 'Acct']]
-    [me.add_meter(x, misc.SmoothedValue(fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accf']]
     header = f'[Ep]: [{ep:4d}/{args.ep}]'
     
     if is_first_ep:
