@@ -36,30 +36,22 @@ class VAR2(nn.Module):
             flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
-
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
 
         self.cond_drop_rate = cond_drop_rate
-        self.prog_si = -1  # progressive training
 
         self.patch_nums: Tuple[int] = patch_nums
-        self.first_l = self.patch_nums[-1] ** 2
-        self.patch_hws = [pn*pn for pn in self.patch_nums]
-        self.patch_hws[0] = self.first_l
-        self.L = sum(self.patch_hws)
+        self.control_l = self.patch_nums[-1] ** 2
+        self.first_l = self.patch_nums[0] ** 2
+        self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.begin_ends = []
         cur = 0
-        for i in range(len(self.patch_nums)):
-            if i == 0:
-                self.begin_ends.append((cur, self.first_l))
-                cur += self.first_l
-            else:
-                pn = self.patch_nums[i]
-                self.begin_ends.append((cur, cur + pn ** 2))
-                cur += pn ** 2
+        for i, pn in enumerate(self.patch_nums):
+            self.begin_ends.append((cur, cur + pn ** 2))
+            cur += pn ** 2
 
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist_utils.get_device())
@@ -69,38 +61,34 @@ class VAR2(nn.Module):
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
+        self.control_embed = nn.Linear(self.Cvae, self.C)
 
         # 2. class embedding
         init_std = math.sqrt(1 / self.C / 3)
-        num_classes = self.V
-        self.num_classes = num_classes
+        self.num_classes = self.V
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-
-        self.cond_embed = nn.Linear(self.Cvae, self.C)
+        self.pos_start = nn.Parameter(torch.empty(1, self.first_l+self.control_l, self.C))
+        nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
 
         # 3. absolute position embedding
         pos_1LC = []
-        for i in range(len(self.patch_nums)):
-            if i == 0:
-                pe = torch.empty(1, self.first_l, self.C)
-                nn.init.trunc_normal_(pe, mean=0, std=init_std)
-            else:
-                pn = self.patch_nums[i]
-                pe = torch.empty(1, pn * pn, self.C)
-                nn.init.trunc_normal_(pe, mean=0, std=init_std)
+        control_pe = torch.empty(1, self.control_l, self.C)
+        nn.init.trunc_normal_(control_pe, mean=0, std=init_std)
+        for i, pn in enumerate(self.patch_nums):
+            pe = torch.empty(1, pn * pn, self.C)
+            nn.init.trunc_normal_(pe, mean=0, std=init_std)
             pos_1LC.append(pe)
+        pos_1LC.insert(0, control_pe)
         pos_1LC = torch.cat(pos_1LC, dim=1)  # 1, L, C
-        assert tuple(pos_1LC.shape) == (1, self.L, self.C)
+        assert tuple(pos_1LC.shape) == (1, self.L+self.control_l, self.C)
         self.pos_1LC = nn.Parameter(pos_1LC)
         # level embedding (similar to GPT's segment embedding, used to distinguish different levels of token pyramid)
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
         # 4. backbone blocks
-        self.shared_aln = shared_aln
-        if self.shared_aln:
-            self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
+        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
                                             SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
@@ -130,11 +118,13 @@ class VAR2(nn.Module):
 
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn,), i) for i, pn in enumerate(self.patch_hws)]).view(1, self.L, 1)
+        mask_items = [torch.full((pn * pn,), i) for i, pn in enumerate(self.patch_nums)]
+        mask_items.insert(0, torch.full((self.control_l,), 0))
+        d: torch.Tensor = torch.cat(mask_items).view(1, self.L+self.control_l, 1)
         dT = d.transpose(1, 2)  # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
-        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
+        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L+self.control_l, self.L+self.control_l)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
 
         # 6. classifier head
@@ -163,32 +153,33 @@ class VAR2(nn.Module):
         B = lq.shape[0]
 
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control = f.reshape(B, self.Cvae, self.control_l).permute(0, 2, 1)
+        control_tokens = self.control_embed(control)
+
+        cond = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
-        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
-        c = self.class_emb(idx0)
+            sos = cond_BD = self.class_emb(cond)
 
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        cur_L = 0
+        pos_start = self.pos_start.expand(B, self.first_l+self.control_l, -1)
+        lvl_pos = self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
+        next_token_map = torch.cat((control_tokens, sos), dim=1)
+        next_token_map = next_token_map + pos_start + lvl_pos[:, :self.first_l+self.control_l]
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-
+        cur_L = self.control_l
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
-            if si == 0:
-                cur_L += self.first_l
-            else:
-                cur_L += self.patch_hws[si]
+            cur_L += pn * pn
             x = next_token_map
-            c_gss = self.shared_ada_lin(c) if self.shared_aln else c
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=c_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD=c)
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD)
             if si == 0:
-                logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
+                logits_BlV = logits_BlV[:, self.control_l:]
+
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -202,41 +193,45 @@ class VAR2(nn.Module):
                                                                                           f_hat, h_BChw)
             if si != self.num_stages_minus_1:  # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map)
-                next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                lvl_p = lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                next_token_map = self.word_embed(next_token_map) + lvl_p
 
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
 
     def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
-        bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
-        B = x_BLCv_wo_first_l.shape[0]
+        B = lq.shape[0]
         f = self.vae_proxy[0].img_to_f(lq)
-        cond = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        control = f.reshape(B, self.Cvae, self.control_l).permute(0, 2, 1)
+        control_tokens = self.control_embed(control)
+
+        cond = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
         with torch.cuda.amp.autocast(enabled=False):
-            sos = self.cond_embed(cond)
-            if self.prog_si == 0:
-                x_BLC = sos
-            else:
-                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
-        c = self.class_emb(idx0)
-        c_gss = self.shared_ada_lin(c) if self.shared_aln else c
-        attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
+            pos_start = self.pos_start.expand(B, self.first_l+self.control_l, -1)
+            lvl_pos = self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
+
+            sos = cond_BD = self.class_emb(cond)
+            sos = torch.cat((control_tokens, sos), dim=1) + pos_start
+
+            x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            x_BLC += lvl_pos
+
+        attn_bias = self.attn_bias_for_masking
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
 
         x_BLC = x_BLC.to(dtype=main_type)
+        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD=c)
-        x_BLC = x_BLC[:, self.first_l-1:]
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
+        x_BLC = x_BLC[:, self.control_l:]
         return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
@@ -299,12 +294,11 @@ class VAR2(nn.Module):
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
-
     def load_state_dict(self, state_dict: Dict[str, Any],
                         strict: bool = True, assign: bool = False, compat=False):
         compat = True
         for key in list(state_dict.keys()):
-            if key.find('cond_embed') != -1:
+            if key.find('control_embed') != -1:
                 compat = False
                 strict = True
                 break
@@ -324,8 +318,6 @@ class VAR2(nn.Module):
                 elif key.find('lvl_1L') != -1:
                     pass
                 elif key.find('attn_bias_for_masking') != -1:
-                    pass
-                elif self.shared_aln and key.find('shared_ada_lin') != -1:
                     pass
                 else:
                     new_state_dict[key] = state_dict.pop(key)
@@ -441,7 +433,7 @@ if __name__ == '__main__':
     import numpy as np
 
     # validate
-    opt = DataOptions.test_options()
+    opt = DataOptions.val_options()
     pprint(opt)
 
     import json

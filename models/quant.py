@@ -146,7 +146,7 @@ class VectorQuantizer2(nn.Module):
         
         return ls_f_hat_BChw
     
-    def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
+    def f_to_idxBl_or_fhat(self, f_BChw: torch.Tensor, to_fhat: bool, v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None, stop_si=-1) -> List[Union[torch.Tensor, torch.LongTensor]]:  # z_BChw is the feature from inp_img_no_grad
         B, C, H, W = f_BChw.shape
         f_no_grad = f_BChw.detach()
         f_rest = f_no_grad.clone()
@@ -160,6 +160,7 @@ class VectorQuantizer2(nn.Module):
         SN = len(patch_hws)
         for si, (ph, pw) in enumerate(patch_hws): # from small to large
             if 0 <= self.prog_si < si: break    # progressive training: not supported yet, prog_si always -1
+            if stop_si >= 0 and si > stop_si: break
             # find the nearest embedding
             z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
             if self.using_znorm:

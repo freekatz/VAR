@@ -49,7 +49,7 @@ def build_model(args):
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR2 = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist_utils.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist_utils.get_local_rank()],
-                                                              find_unused_parameters=True, broadcast_buffers=False)
+                                                              find_unused_parameters=False, broadcast_buffers=False)
 
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters()) / 1e6:.2f}'
