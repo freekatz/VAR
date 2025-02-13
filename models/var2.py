@@ -50,6 +50,7 @@ class VAR2(nn.Module):
         self.patch_hws = [pn*pn for pn in self.patch_nums]
         self.patch_hws[0] = self.first_l
         self.L = sum(self.patch_hws)
+        self.last_l = self.patch_hws[-1]
         self.begin_ends = []
         cur = 0
         for i in range(len(self.patch_nums)):
@@ -118,6 +119,7 @@ class VAR2(nn.Module):
             )
             for block_idx in range(depth)
         ])
+        self.proj = nn.Linear(self.D, self.Cvae)
 
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
@@ -208,7 +210,7 @@ class VAR2(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
 
-    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> (torch.Tensor, torch.Tensor):  # returns logits_BLV
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         f = self.vae_proxy[0].img_to_f(lq)
@@ -235,9 +237,10 @@ class VAR2(nn.Module):
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
+        f = self.proj(x_BLC[:, :self.first_l]).permute(0, 2, 1).reshape(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         x_BLC = self.get_logits(x_BLC.float(), cond_BD=c)
-        x_BLC = x_BLC[:, self.first_l-1:]
-        return x_BLC  # logits BLV, V is vocab_size
+        # x_BLC = x_BLC[:, self.first_l-1:]
+        return x_BLC, f  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
@@ -497,13 +500,15 @@ if __name__ == '__main__':
 
         idx_hq = var_wo_ddp.vae_proxy[0].img_to_idxBl(hq)
         x_BLCv_wo_first_l = var_wo_ddp.vae_quant_proxy[0].idxBl_to_var_input(idx_hq)
-        logits = var_wo_ddp(lq, x_BLCv_wo_first_l)
+        logits, _ = var_wo_ddp(lq, x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
+        pred = pred[:, var_wo_ddp.first_l-1:]
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
         lq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
 
-        logits = var_wo_ddp(hq, x_BLCv_wo_first_l)
+        logits, _ = var_wo_ddp(hq, x_BLCv_wo_first_l)
         pred = torch.argmax(logits, dim=-1)
+        pred = pred[:, var_wo_ddp.first_l-1:]
         pred = list(torch.split(pred, [ph * pw for (ph, pw) in var_wo_ddp.vae_proxy[0].patch_hws], dim=1))
         hq_res = var_wo_ddp.vae_proxy[0].idxBl_to_img(pred, same_shape=True)[-1]
 

@@ -37,15 +37,15 @@ class AmpOptimizer:
         self.r_accu = 1 / n_gradient_accumulation   # r_accu == 1.0 / n_gradient_accumulation
     
     def backward_clip_step(
-        self, stepping: bool, loss: torch.Tensor,
+        self, stepping: bool, loss: torch.Tensor, retain_graph: bool=False
     ) -> Tuple[Optional[Union[torch.Tensor, float]], Optional[float]]:
         # backward
         loss = loss.mul(self.r_accu)   # r_accu == 1.0 / n_gradient_accumulation
         orig_norm = scaler_sc = None
         if self.scaler is not None:
-            self.scaler.scale(loss).backward(retain_graph=False, create_graph=False)
+            self.scaler.scale(loss).backward(retain_graph=retain_graph, create_graph=False)
         else:
-            loss.backward(retain_graph=False, create_graph=False)
+            loss.backward(retain_graph=retain_graph, create_graph=False)
         
         if stepping:
             if self.scaler is not None: self.scaler.unscale_(self.optimizer)

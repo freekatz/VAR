@@ -34,11 +34,16 @@ class VAR2Trainer(object):
         self.var_wo_ddp.rng = torch.Generator(device=device)
 
         self.label_smooth = label_smooth
-        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
+        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='mean')
+        self.train_loss_l2 = nn.MSELoss(reduction='mean')
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
-        self.L = sum(pn * pn for pn in patch_nums)
+        self.val_loss_l2 = nn.MSELoss(reduction='mean')
+
+        self.first_l = self.var_wo_ddp.first_l
+        self.L = self.var_wo_ddp.L - self.var_wo_ddp.first_l
         self.last_l = patch_nums[-1] * patch_nums[-1]
         self.loss_weight = torch.ones(1, self.L, device=device) / self.L
+        self.loss_weight_first = torch.ones(1, self.first_l, device=device) / self.L
 
         self.patch_nums, self.resos = patch_nums, resos
         self.begin_ends = []
@@ -104,39 +109,44 @@ class VAR2Trainer(object):
         B, V = lq.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
 
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(hq)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1)
+        f_gt = self.vae_local.quant_conv(self.vae_local.encoder(hq))
+        gt_idx_Bl: List[ITen] = self.vae_local.quantize.f_to_idxBl_or_fhat(f_gt, to_fhat=False)
         x_BLCv_wo_first_l = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        gt_BL = torch.cat(gt_idx_Bl[1:], dim=1)
+        gt_BL_first = torch.repeat_interleave(gt_idx_Bl[0], self.first_l, dim=1)
 
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            logits_BLV = self.var(lq, x_BLCv_wo_first_l)
-            loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.view(-1)).view(B, -1)
-            if prog_si >= 0:  # in progressive training
-                bg, ed = self.begin_ends[prog_si]
-                assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
-                lw = self.loss_weight[:, :ed].clone()
-                lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
-            else:  # not in progressive training
-                lw = self.loss_weight
-            loss = loss.mul(lw).sum(dim=-1).mean()
+            logits, f_tail = self.var(lq, x_BLCv_wo_first_l)
+            logits_BLV = logits[:, -self.L:]
+            logits_BLV_first = logits[:, :self.first_l]
+
+            loss = self.train_loss(logits_BLV.reshape(-1, V), gt_BL.view(-1))
+            loss_first = self.train_loss(logits_BLV_first.reshape(-1, V), gt_BL_first.view(-1))
+            loss_mse = self.train_loss_l2(f_tail, f_gt)
+
+            loss = (loss + loss_first) * 0.75 + loss_mse * 0.25
 
         # backward
-        grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
+        grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping, retain_graph=True)
 
         # log
         pred_BL = logits_BLV.data.argmax(dim=-1)
+        pred_BL_first = logits_BLV_first.data.argmax(dim=-1)
         if it == 0 or it in metric_lg.log_iters:
             Lmean = self.val_loss(logits_BLV.data.reshape(-1, V), gt_BL.view(-1)).item()
+            Lfirst = self.val_loss(logits_BLV_first.data.reshape(-1, V),
+                                  gt_BL_first.reshape(-1)).item()
+            Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V),
+                                gt_BL[:, -self.last_l:].reshape(-1)).item()
+            Lmse = self.val_loss_l2(f_tail, f_gt).item()
+
             acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
-            if prog_si >= 0:  # in progressive training
-                Ltail = acc_tail = -1
-            else:  # not in progressive training
-                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V),
-                                      gt_BL[:, -self.last_l:].reshape(-1)).item()
-                acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
+            acc_first = (pred_BL_first == gt_BL_first).float().mean().item() * 100
+            acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
+
             grad_norm = grad_norm.item()
-            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
+            metric_lg.update(Lm=Lmean, Lf=Lfirst, Lt=Ltail, Lmse=Lmse, Accm=acc_mean, Accf=acc_first, Acct=acc_tail, tnm=grad_norm)
 
         # log to tensorboard
         if g_it == 0 or (g_it + 1) % 500 == 0:

@@ -15,13 +15,13 @@ class DataOptions(dict):
             'mid_size': 288,  # train
             'random_crop_ratio': 0.8,  # train
             'identify_ratio': 0.,
-            'blur_kernel_size': [13, 19, 23, 29, 31, 37, 41],
+            'blur_kernel_size': [41],
             'kernel_list': ['iso', 'aniso'],
             'kernel_prob': [0.5, 0.5],
-            'blur_sigma': [1, 10],
+            'blur_sigma': [0.1, 10],
             'downsample_range': [0.8, 8],
             'noise_range': [0, 20],
-            'jpeg_range': [30, 80],
+            'jpeg_range': [60, 100],
             'use_hflip': True,
             'color_jitter_prob': None,
             'color_jitter_shift': 20,
