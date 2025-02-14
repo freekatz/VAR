@@ -113,7 +113,7 @@ class Args(Tap):
     
     # environment
     local_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # [automatically set; don't specify this]
-    visual_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'visual_output')
+    visual_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output', 'visual_output')
     tb_log_dir_path: str = '...tb-...'  # [automatically set; don't specify this]
     log_txt_path: str = '...'           # [automatically set; don't specify this]
     last_ckpt_path: str = '...'         # [automatically set; don't specify this]

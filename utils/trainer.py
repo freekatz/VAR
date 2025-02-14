@@ -112,9 +112,14 @@ class VARTrainer(object):
                 chw.save(filepath)
                 print(f'[testing ...] @ep{ep} saved {filepath}, images: {mid*2}')
 
+                vis_count = 0
+                lq_list = []
+                hq_list = []
+                lq_res_list = []
+                hq_res_list = []
                 if (len(ld_test) - i - 1) // vis_max_count == 0:
                     break
-                vis_count = 0
+
 
     @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):

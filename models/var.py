@@ -502,5 +502,5 @@ if __name__ == '__main__':
                             {'opt': opt}, split='test')
     ld = build_data_loader(args, 0, 0, dataset=ds,
                                dataset_params={'opt': opt}, split='test')
-    out_dir = Path(args.visual_out_dir_path).parent / 'visual_output_tmp'
+    out_dir = Path(args.visual_out_dir_path).parent / 'local_output/visual_output_tmp'
     test_ep(ld, 0, out_dir)
