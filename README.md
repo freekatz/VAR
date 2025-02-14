@@ -23,4 +23,5 @@
 ## Acknowledgment
 
 - VAR: https://github.com/FoundationVision/VAR
-
+- FFHQ: https://github.com/NVlabs/ffhq-dataset
+- CelebA HQ: https://github.com/tkarras/progressive_growing_of_gans

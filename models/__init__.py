@@ -34,7 +34,7 @@ def build_vae_var(
     # build models
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums).to(device)
-    var_wo_ddp = VAR(
+    var_local = VAR(
         vae_local=vae_local,
         depth=depth, embed_dim=width, num_heads=heads, drop_rate=0., attn_drop_rate=0.,
         drop_path_rate=dpr,
@@ -44,7 +44,7 @@ def build_vae_var(
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     ).to(device)
     if (args.pretrain is None or args.pretrain == '') or (args.resume is None or args.resume == ''):
-        var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
+        var_local.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
                             init_std=init_std)
 
-    return vae_local, var_wo_ddp
+    return vae_local, var_local

@@ -2,7 +2,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 from collections import OrderedDict
@@ -56,7 +55,7 @@ class Args(Tap):
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
     ac: int = 1             # gradient accumulation
     test_freq: int = 1
-    save_freq: int = 1
+    val_freq: int = 1
 
     ep: int = 100
     wp: float = 0
@@ -85,11 +84,6 @@ class Args(Tap):
     hflip: bool = False         # augmentation: horizontal flip
     workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
 
-    # progressive training
-    pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
-    pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
-    pgwp: float = 0         # num of warmup epochs at each progressive stage
-    
     # would be automatically set in runtime
     # cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
     # branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
@@ -222,19 +216,7 @@ def init_dist_and_get_args():
             del sys.argv[i]
             break
     args = Args(explicit_bool=True).parse_args(known_only=True)
-    if args.local_debug:
-        args.pn = '1_2_3'
-        args.seed = 1
-        args.aln = 1e-2
-        args.alng = 1e-5
-        args.saln = False
-        args.afuse = False
-        args.pg = 0.8
-        args.pg0 = 1
-    else:
-        if args.data_path == '/path/to/imagenet':
-            raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
-    
+
     # warn args.extra_args
     if len(args.extra_args) > 0:
         print(f'======================================================================================')
@@ -249,7 +231,7 @@ def init_dist_and_get_args():
     
     # set env
     args.set_tf32(args.tf32)
-    args.seed_everything(benchmark=args.pg == 0)
+    args.seed_everything(benchmark=True)
     
     # update args: data loading
     args.device = dist_utils.get_device()
@@ -274,13 +256,7 @@ def init_dist_and_get_args():
     
     if args.wp == 0:
         args.wp = args.ep * 1/50
-    
-    # update args: progressive training
-    if args.pgwp == 0:
-        args.pgwp = args.ep * 1/300
-    if args.pg > 0:
-        args.sche = f'lin{args.pg:g}'
-    
+
     # update args: paths
     args.log_txt_path = os.path.join(args.local_out_dir_path, 'log.txt')
     args.last_ckpt_path = os.path.join(args.local_out_dir_path, f'ar-ckpt-last.pth')

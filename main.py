@@ -10,36 +10,38 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils import dist_utils
 from utils import arg_util, misc
 from utils.data import build_data_loader, build_dataset
 from utils.dataset.options import DataOptions
 from utils.misc import maybe_resume, maybe_pretrain
+from utils.lr_control import lr_wd_annealing
+from models import VAR, VQVAE, build_vae_var
+from utils.amp_sc import AmpOptimizer
+from utils.lr_control import filter_params
 
 
 def build_tensorboard_logger(args: arg_util.Args):
-    tb_lg: misc.TensorboardLogger
-    with_tb_lg = dist_utils.is_master()
-    if with_tb_lg:
+    tensor_board: misc.TensorboardLogger
+    with_tensor_board = dist_utils.is_master()
+    if with_tensor_board:
         os.makedirs(args.tb_log_dir_path, exist_ok=True)
         # noinspection PyTypeChecker
-        tb_lg = misc.DistLogger(
+        tensor_board = misc.DistLogger(
             misc.TensorboardLogger(log_dir=args.tb_log_dir_path, filename_suffix=f'__{misc.time_str("%m%d_%H%M")}'),
             verbose=True)
-        tb_lg.flush()
+        tensor_board.flush()
     else:
         # noinspection PyTypeChecker
-        tb_lg = misc.DistLogger(None, verbose=False)
+        tensor_board = misc.DistLogger(None, verbose=False)
     dist_utils.barrier()
-    return tb_lg
+    return tensor_board
 
 
 def build_model(args):
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
-
-    vae_local, var_wo_ddp = build_vae_var(
+    vae_local, var_local = build_vae_var(
         args=args,
         V=4096, Cvae=32, ch=160, share_quant_resi=4,  # hard-coded VQVAE hyperparameters
         device=dist_utils.get_device(), patch_nums=args.patch_nums,
@@ -50,39 +52,36 @@ def build_model(args):
     vae_local.load_state_dict(torch.load(args.vae_path, map_location='cpu'), strict=True)
 
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
-    var: DDP = (DDP if dist_utils.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist_utils.get_local_rank()],
+    var_local: VAR = args.compile_model(var_local, args.tfast)
+    var_ddp: DDP = (DDP if dist_utils.initialized() else NullDDP)(var_local, device_ids=[dist_utils.get_local_rank()],
                                                               find_unused_parameters=False, broadcast_buffers=False)
 
-    print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
+    print(f'[INIT] VAR model = {var_local}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters()) / 1e6:.2f}'
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (
     ('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder),
     ('VAE.quant', vae_local.quantize))]))
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
-    return vae_local, var_wo_ddp, var
+    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_local),)]) + '\n\n')
+    return vae_local, var_local, var_ddp
 
 
-def build_optimizer(args: arg_util.Args, var_wo_ddp):
-    from utils.amp_sc import AmpOptimizer
-    from utils.lr_control import filter_params
-
-    names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
+def build_optimizer(args: arg_util.Args, var_local):
+    names, paras, para_groups = filter_params(var_local, nowd_keys={
         'cls_token', 'start_token', 'task_token', 'cfg_uncond',
         'pos_embed', 'pos_1LC', 'pos_start', 'start_pos', 'lvl_embed',
         'gamma', 'beta',
         'ada_gss', 'moe_bias',
         'scale_mul',
     })
-    opt_clz = {
+    opt_class = {
         'adam': partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
         'adamw': partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
     }[args.opt.lower().strip()]
-    opt_kw = dict(lr=args.tlr, weight_decay=0)
-    print(f'[INIT] optim={opt_clz}, opt_kw={opt_kw}\n')
+    opt_params = dict(lr=args.tlr, weight_decay=0)
+    print(f'[INIT] optim={opt_class}, opt_params={opt_params}\n')
 
     var_optim = AmpOptimizer(
-        mixed_precision=args.fp16, optimizer=opt_clz(params=para_groups, **opt_kw), names=names, paras=paras,
+        mixed_precision=args.fp16, optimizer=opt_class(params=para_groups, **opt_params), names=names, paras=paras,
         grad_clip=args.tclip, n_gradient_accumulation=args.ac
     )
     del names, paras, para_groups
@@ -95,10 +94,10 @@ def build_everything(args: arg_util.Args):
     if len(trainer_state) == 0:
         trainer_state = maybe_pretrain(args)
     # create tensorboard logger
-    tb_lg = build_tensorboard_logger(args)
+    tensor_board = build_tensorboard_logger(args)
     
     # log args
-    print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
+    print(f'global batch size={args.glb_batch_size}, local batch size={args.batch_size}')
     print(f'initial args:\n{str(args)}')
 
     # build data
@@ -129,25 +128,25 @@ def build_everything(args: arg_util.Args):
     print(f'[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}')
 
     # build models
-    vae_local, var_wo_ddp, var = build_model(args)
+    vae_local, var_local, var_ddp = build_model(args)
 
     # build optimizer
-    var_optim = build_optimizer(args, var_wo_ddp)
+    var_optim = build_optimizer(args, var_local)
     
     # build trainer
     from utils.trainer import VARTrainer
     trainer = VARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
-        vae_local=vae_local, var_wo_ddp=var_wo_ddp, var=var,
+        vae_local=vae_local, var_local=var_local, var_ddp=var_ddp,
         var_opt=var_optim, label_smooth=args.ls,
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
-    del vae_local, var_wo_ddp, var, var_optim
+    del vae_local, var_local, var_ddp, var_optim
 
     dist_utils.barrier()
     return (
-        tb_lg, trainer, start_ep, start_it,
+        tensor_board, trainer, start_ep, start_it,
         iters_train, ld_train, ld_val, ld_test
     )
 
@@ -158,12 +157,13 @@ def main_training():
         torch.autograd.set_detect_anomaly(True)
     
     (
-        tb_lg, trainer,
+        tensor_board, trainer,
         start_ep, start_it,
         iters_train, ld_train, ld_val, ld_test
     ) = build_everything(args)
     
     # train
+    # Lmean is loss about all scalers logits (680), Ltail is loss about last scaler logits (256)
     start_time = time.time()
     best_L_mean, best_L_tail, best_acc_mean, best_acc_tail = 999., 999., -1., -1.
     best_val_loss_mean, best_val_loss_tail, best_val_acc_mean, best_val_acc_tail = 999, 999, -1, -1
@@ -175,11 +175,11 @@ def main_training():
             if ep < 3:
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
-        tb_lg.set_step(ep * iters_train)
+        tensor_board.set_step(ep * iters_train)
 
         print(f'[train ...]@ep{ep}')
         stats, (sec, remain_time, finish_time) = train_one_ep(
-            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
+            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tensor_board, ld_train, iters_train, trainer
         )
         
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
@@ -190,7 +190,7 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % args.save_freq == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % args.val_freq == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
             print(f'[val ...]@ep{ep}')
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
@@ -216,7 +216,8 @@ def main_training():
                 }, local_out_ckpt)
                 if best_updated:
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
-                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+                    print(f'     [saving ckpt](*) finished! best @ {local_out_ckpt}', flush=True, clean=True)
+                print(f'     [saving ckpt](*) finished! last @ {local_out_ckpt}', flush=True, clean=True)
             dist_utils.barrier()
 
         is_test = (ep + 1) % args.test_freq == 0 or (ep + 1) == args.ep and ld_test is not None
@@ -228,9 +229,9 @@ def main_training():
 
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
-        tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
-        tb_lg.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
-        args.dump_log(); tb_lg.flush()
+        tensor_board.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
+        tensor_board.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
+        args.dump_log(); tensor_board.flush()
     
     total_time = f'{(time.time() - start_time) / 60 / 60:.1f}h'
     print('\n\n')
@@ -242,20 +243,15 @@ def main_training():
     
     args.remain_time, args.finish_time = '-', time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 60))
     print(f'final args:\n\n{str(args)}')
-    args.dump_log(); tb_lg.flush(); tb_lg.close()
+    args.dump_log(); tensor_board.flush(); tensor_board.close()
     dist_utils.barrier()
 
 
-def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
-    # import heavy packages after Dataloader object creation
-    from utils.trainer import VARTrainer
-    from utils.lr_control import lr_wd_annealing
-    trainer: VARTrainer
-    
+def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tensor_board: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
     step_cnt = 0
     me = misc.MetricLogger(delimiter='|')
-    me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
-    me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+    me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))  # learn rate
+    me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))  # grad clips
     [me.add_meter(x, misc.SmoothedValue(fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
     [me.add_meter(x, misc.SmoothedValue(fmt='{median:.2f} ({global_avg:.2f})')) for x in ['Accm', 'Acct']]
     header = f'[Ep]: [{ep:4d}/{args.ep}]'
@@ -280,35 +276,26 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.var_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
         args.cur_lr, args.cur_wd = max_tlr, max_twd
         
-        if args.pg: # default: args.pg == 0.0, means no progressive training, won't get into this
-            if g_it <= wp_it: prog_si = args.pg0
-            elif g_it >= max_it*args.pg: prog_si = len(args.patch_nums) - 1
-            else:
-                delta = len(args.patch_nums) - 1 - args.pg0
-                progress = min(max((g_it - wp_it) / (max_it*args.pg - wp_it), 0), 1) # from 0 to 1
-                prog_si = args.pg0 + round(progress * delta)    # from args.pg0 to len(args.patch_nums)-1
-        else:
-            prog_si = -1
-        
         stepping = (g_it + 1) % args.ac == 0
         step_cnt += int(stepping)
         
         grad_norm, scale_log2 = trainer.train_step(
-            it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
-            lq=lq, hq=hq, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+            it=it, g_it=g_it, stepping=stepping,
+            metric_lg=me, tensor_board=tensor_board,
+            lq=lq, hq=hq
         )
         
         me.update(tlr=max_tlr)
-        tb_lg.set_step(step=g_it)
-        tb_lg.update(head='AR_opt_lr/lr_min', sche_tlr=min_tlr)
-        tb_lg.update(head='AR_opt_lr/lr_max', sche_tlr=max_tlr)
-        tb_lg.update(head='AR_opt_wd/wd_max', sche_twd=max_twd)
-        tb_lg.update(head='AR_opt_wd/wd_min', sche_twd=min_twd)
-        tb_lg.update(head='AR_opt_grad/fp16', scale_log2=scale_log2)
+        tensor_board.set_step(step=g_it)
+        tensor_board.update(head='AR_opt_lr/lr_min', sche_tlr=min_tlr)
+        tensor_board.update(head='AR_opt_lr/lr_max', sche_tlr=max_tlr)
+        tensor_board.update(head='AR_opt_wd/wd_max', sche_twd=max_twd)
+        tensor_board.update(head='AR_opt_wd/wd_min', sche_twd=min_twd)
+        tensor_board.update(head='AR_opt_grad/fp16', scale_log2=scale_log2)
         
         if args.tclip > 0:
-            tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
-            tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
+            tensor_board.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
+            tensor_board.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
     
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost

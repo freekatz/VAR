@@ -37,10 +37,7 @@ class VectorQuantizer2(nn.Module):
         
         self.beta: float = beta
         self.embedding = nn.Embedding(self.vocab_size, self.Cvae)
-        
-        # only used for progressive training of VAR (not supported yet, will be tested and supported in the future)
-        self.prog_si = -1   # progressive training: not supported yet, prog_si always -1
-    
+
     def eini(self, eini):
         if eini > 0: nn.init.trunc_normal_(self.embedding.weight.data, std=eini)
         elif eini < 0: self.embedding.weight.data.uniform_(-abs(eini) / self.vocab_size, abs(eini) / self.vocab_size)
@@ -159,7 +156,6 @@ class VectorQuantizer2(nn.Module):
         
         SN = len(patch_hws)
         for si, (ph, pw) in enumerate(patch_hws): # from small to large
-            if 0 <= self.prog_si < si: break    # progressive training: not supported yet, prog_si always -1
             if stop_si >= 0 and si > stop_si: break
             # find the nearest embedding
             z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (si != SN-1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)
@@ -191,7 +187,6 @@ class VectorQuantizer2(nn.Module):
         f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
         pn_next: int = self.v_patch_nums[0]
         for si in range(SN-1):
-            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # progressive training: not supported yet, prog_si always -1
             h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
             f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
             pn_next = self.v_patch_nums[si+1]
@@ -215,7 +210,6 @@ class VectorQuantizer2(nn.Module):
 
         SN = len(patch_hws)
         for si, (ph, pw) in enumerate(patch_hws):  # from small to large
-            if 0 <= self.prog_si < si: break  # progressive training: not supported yet, prog_si always -1
             # find the nearest embedding
             z_NC = F.interpolate(f_rest, size=(ph, pw), mode='area').permute(0, 2, 3, 1).reshape(-1, C) if (
                         si != SN - 1) else f_rest.permute(0, 2, 3, 1).reshape(-1, C)

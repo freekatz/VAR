@@ -371,7 +371,7 @@ def maybe_pretrain(args: arg_util.Args):
 
     dist_utils.barrier()
     trainer_state = {
-        'var_wo_ddp': ckpt,
+        'var_local': ckpt,
     }
     print(f'[pretrain] load success @ {pretrain}')
     return trainer_state
