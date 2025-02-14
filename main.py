@@ -1,17 +1,21 @@
 import gc
 import os
+import random
 import shutil
 import sys
 import time
 import warnings
 from functools import partial
+from pathlib import Path
+warnings.filterwarnings("ignore")
 
 import torch
 
 from utils import dist_utils
 from utils import arg_util, misc
-from utils.data import build_data_loader, build_transforms_params
-from utils.misc import maybe_resume
+from utils.data import build_data_loader, build_dataset
+from utils.dataset.options import DataOptions
+from utils.misc import maybe_resume, maybe_pretrain
 
 
 def build_tensorboard_logger(args: arg_util.Args):
@@ -36,9 +40,10 @@ def build_model(args):
     from models import VAR, VQVAE, build_vae_var
 
     vae_local, var_wo_ddp = build_vae_var(
+        args=args,
         V=4096, Cvae=32, ch=160, share_quant_resi=4,  # hard-coded VQVAE hyperparameters
         device=dist_utils.get_device(), patch_nums=args.patch_nums,
-        num_classes=args.num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
+        depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
         flash_if_available=args.fuse, fused_if_available=args.fuse,
         init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
     )
@@ -47,7 +52,7 @@ def build_model(args):
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist_utils.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist_utils.get_local_rank()],
-                                                              find_unused_parameters=True, broadcast_buffers=False)
+                                                              find_unused_parameters=False, broadcast_buffers=False)
 
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters()) / 1e6:.2f}'
@@ -87,20 +92,32 @@ def build_optimizer(args: arg_util.Args, var_wo_ddp):
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = maybe_resume(args)
+    if len(trainer_state) == 0:
+        trainer_state = maybe_pretrain(args)
     # create tensorboard logger
     tb_lg = build_tensorboard_logger(args)
     
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
-    
+
     # build data
     print(f'[build PT data] ...\n')
-    train_params, val_params = build_transforms_params(args)
-    train_params['use_hflip'] = args.hflip
-    val_params['use_hflip'] = args.hflip
-    ld_train = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=train_params, split='train')
-    ld_val = build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=val_params, split='val')
+    train_opt = DataOptions.train_options()
+    ld_train = build_data_loader(args, start_ep, start_it, dataset=None,
+                                 dataset_params={'opt': train_opt}, split='train')
+    val_opt = DataOptions.val_options()
+    ld_val = build_data_loader(args, start_ep, start_it, dataset=None,
+                               dataset_params={'opt': val_opt}, split='val')
+
+    if len(args.data_path_test) > 0:
+        test_opt = DataOptions.test_options()
+        test_ds = build_dataset(args.dataset_name_test, args.data_path_test,
+                                {'opt': test_opt}, split='test')
+        ld_test = build_data_loader(args, start_ep, start_it, dataset=test_ds,
+                                    dataset_params=None, split='test')
+    else:
+        ld_test = None
 
     [print(line) for line in auto_resume_info]
     print(f'[dataloader multi processing] ...', end='', flush=True)
@@ -131,7 +148,7 @@ def build_everything(args: arg_util.Args):
     dist_utils.barrier()
     return (
         tb_lg, trainer, start_ep, start_it,
-        iters_train, ld_train, ld_val
+        iters_train, ld_train, ld_val, ld_test
     )
 
 
@@ -143,7 +160,7 @@ def main_training():
     (
         tb_lg, trainer,
         start_ep, start_it,
-        iters_train, ld_train, ld_val
+        iters_train, ld_train, ld_val, ld_test
     ) = build_everything(args)
     
     # train
@@ -159,7 +176,8 @@ def main_training():
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
-        
+
+        print(f'[train ...]@ep{ep}')
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
         )
@@ -174,6 +192,7 @@ def main_training():
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         is_val_and_also_saving = (ep + 1) % args.save_freq == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
+            print(f'[val ...]@ep{ep}')
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
@@ -184,8 +203,11 @@ def main_training():
             
             if dist_utils.is_local_master():
                 local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
+                local_out_ckpt_bak = os.path.join(args.local_out_dir_path, 'ar-ckpt-last-bak.pth')
                 local_out_ckpt_best = os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth')
                 print(f'[saving ckpt] ...', end='', flush=True)
+                if os.path.exists(local_out_ckpt):
+                    shutil.move(local_out_ckpt, local_out_ckpt_bak)
                 torch.save({
                     'epoch':    ep+1,
                     'iter':     0,
@@ -196,6 +218,14 @@ def main_training():
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
             dist_utils.barrier()
+
+        is_test = (ep + 1) % args.test_freq == 0 or (ep + 1) == args.ep and ld_test is not None
+        if is_test and dist_utils.is_local_master():
+            print(f'[test ...]@ep{ep}')
+            out_dir = Path(args.visual_out_dir_path)
+            trainer.test_ep(ld_test, ep, out_dir)
+        dist_utils.barrier()
+
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
@@ -207,7 +237,6 @@ def main_training():
     print(f'  [*] [PT finished]  Total cost: {total_time},   Lm: {best_L_mean:.3f} ({L_mean}),   Lt: {best_L_tail:.3f} ({L_tail})')
     print('\n\n')
     
-    del stats
     del iters_train, ld_train
     time.sleep(3), gc.collect(), torch.cuda.empty_cache(), time.sleep(3)
     
@@ -224,7 +253,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     trainer: VARTrainer
     
     step_cnt = 0
-    me = misc.MetricLogger(delimiter='  ')
+    me = misc.MetricLogger(delimiter='|')
     me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
     me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     [me.add_meter(x, misc.SmoothedValue(fmt='{median:.3f} ({global_avg:.3f})')) for x in ['Lm', 'Lt']]
@@ -235,42 +264,15 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=DeprecationWarning)
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
-    doing_profiling = args.prof and is_first_ep and (args.profall or dist_utils.is_master())
-    parallel = 'ddp'
-    if os.getenv('NCCL_CROSS_NIC', '0') == '1':
-        parallel += f'_NIC1'
-    profiling_name = f'var_bs{args.bs}_{parallel}_GPU{dist_utils.get_local_rank()}of{dist_utils.get_world_size()}'
 
-    profiler = None
-    if doing_profiling:
-        profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=40,
-                warmup=3,
-                active=2,
-                repeat=1,
-            ),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.local_out_dir_path, profiling_name)
-        )
-        profiler.start()
-
-    for it, (inp, label) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    for it, data in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
         g_it = ep * iters_train + it
         if it < start_it: continue
         if is_first_ep and it == start_it: warnings.resetwarnings()
 
-        if doing_profiling:
-            profiler.step()
-
-        inp = inp.to(args.device, non_blocking=True)
-        label = label.to(args.device, non_blocking=True)
+        lq, hq = data['lq'], data['gt']
+        lq = lq.to(args.device, non_blocking=True)
+        hq = hq.to(args.device, non_blocking=True)
         
         args.cur_it = f'{it+1}/{iters_train}'
         
@@ -293,7 +295,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         
         grad_norm, scale_log2 = trainer.train_step(
             it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+            lq=lq, hq=hq, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
         
         me.update(tlr=max_tlr)

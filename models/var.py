@@ -1,13 +1,21 @@
 import math
+from collections import OrderedDict
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Mapping, Any, Dict
+import sys, os
+
+from einops import repeat
+
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../'))
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
+import numpy as np
+import torchvision
 
 from utils import dist_utils
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, AdaLNCrossAttn, FeatureFusionBlock
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
@@ -39,13 +47,21 @@ class VAR(nn.Module):
         self.prog_si = -1  # progressive training
 
         self.patch_nums: Tuple[int] = patch_nums
-        self.L = sum(pn ** 2 for pn in self.patch_nums)
-        self.first_l = self.patch_nums[0] ** 2
+        self.first_l = self.patch_nums[-1] ** 2
+        self.patch_hws = [pn*pn for pn in self.patch_nums]
+        self.patch_hws[0] = self.first_l
+        self.L = sum(self.patch_hws)
+        self.last_l = self.patch_hws[-1]
         self.begin_ends = []
         cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur + pn ** 2))
-            cur += pn ** 2
+        for i in range(len(self.patch_nums)):
+            if i == 0:
+                self.begin_ends.append((cur, self.first_l))
+                cur += self.first_l
+            else:
+                pn = self.patch_nums[i]
+                self.begin_ends.append((cur, cur + pn ** 2))
+                cur += pn ** 2
 
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist_utils.get_device())
@@ -58,19 +74,23 @@ class VAR(nn.Module):
 
         # 2. class embedding
         init_std = math.sqrt(1 / self.C / 3)
+        num_classes = self.V
         self.num_classes = num_classes
-        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
-                                       device=dist_utils.get_device())
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-        self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
-        nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
+
+        self.control_embed = nn.Linear(self.Cvae, self.C)
 
         # 3. absolute position embedding
         pos_1LC = []
-        for i, pn in enumerate(self.patch_nums):
-            pe = torch.empty(1, pn * pn, self.C)
-            nn.init.trunc_normal_(pe, mean=0, std=init_std)
+        for i in range(len(self.patch_nums)):
+            if i == 0:
+                pe = torch.empty(1, self.first_l, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
+            else:
+                pn = self.patch_nums[i]
+                pe = torch.empty(1, pn * pn, self.C)
+                nn.init.trunc_normal_(pe, mean=0, std=init_std)
             pos_1LC.append(pe)
         pos_1LC = torch.cat(pos_1LC, dim=1)  # 1, L, C
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
@@ -80,7 +100,9 @@ class VAR(nn.Module):
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
 
         # 4. backbone blocks
-        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
+        self.shared_aln = shared_aln
+        if self.shared_aln:
+            self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False),
                                             SharedAdaLin(self.D, 6 * self.C)) if shared_aln else nn.Identity()
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
@@ -93,11 +115,12 @@ class VAR(nn.Module):
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx],
                 last_drop_p=0 if block_idx == 0 else dpr[block_idx - 1],
-                attn_l2_norm=attn_l2_norm,
+                attn_l2_norm=attn_l2_norm, add_cond=True,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
             )
             for block_idx in range(depth)
         ])
+        # self.proj = nn.Linear(self.D, self.Cvae)
 
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
@@ -110,8 +133,7 @@ class VAR(nn.Module):
 
         # 5. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn * pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L,
-                                                                                                              1)
+        d: torch.Tensor = torch.cat([torch.full((pn,), i) for i, pn in enumerate(self.patch_hws)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)  # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
@@ -133,70 +155,43 @@ class VAR(nn.Module):
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
-            self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
+            self, lq: torch.Tensor,
             g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
             more_smooth=False,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
-        """
-        only used for inference, on autoregressive mode
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
-        """
         if g_seed is None:
             rng = None
         else:
             self.rng.manual_seed(g_seed); rng = self.rng
+        B = lq.shape[0]
 
-        if label_B is None:
-            label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-        elif isinstance(label_B, int):
-            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B,
-                                 device=self.lvl_1L.device)
-
-        sos = cond_BD = self.class_emb(
-            torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        f = self.vae_proxy[0].img_to_f(lq)
+        control = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
+        with torch.cuda.amp.autocast(enabled=False):
+            control_tokens = self.control_embed(control)
+        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
+        cond = self.class_emb(idx0)
 
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l,
-                                                                                                  -1) + lvl_pos[:,
-                                                                                                        :self.first_l]
-
+        next_token_map = control_tokens.reshape(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = control_tokens.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
-            cur_L += pn * pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            if si == 0:
+                cur_L += self.first_l
+            else:
+                cur_L += self.patch_hws[si]
             x = next_token_map
+            cond_gss = self.shared_ada_lin(cond) if self.shared_aln else cond
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            # x torch.Size([2, 1, 1024])
-            # x torch.Size([2, 4, 1024])
-            # x torch.Size([2, 9, 1024])
-            # x torch.Size([2, 16, 1024])
-            # x torch.Size([2, 25, 1024])
-            # x torch.Size([2, 36, 1024])
-            # x torch.Size([2, 64, 1024])
-            # x torch.Size([2, 100, 1024])
-            # x torch.Size([2, 169, 1024])
-            # x torch.Size([2, 256, 1024])
-            logits_BlV = self.get_logits(x, cond_BD)
-
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            # print('logits_BlV', logits_BlV.shape)
-
+                x = b(x=x, cond_BD=cond_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD=cond)
+            if si == 0:
+                logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
@@ -210,61 +205,42 @@ class VAR(nn.Module):
                                                                                           f_hat, h_BChw)
             if si != self.num_stages_minus_1:  # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:,
-                                                                   cur_L:cur_L + self.patch_nums[si + 1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)  # double the batch sizes due to CFG
+                next_token_map = self.word_embed(next_token_map)
+                next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
 
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
 
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
-        """
-        :param label_B: label_B
-        :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
-        :return: logits BLV, V is vocab_size
-        """
+    def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> (torch.Tensor, torch.Tensor):  # returns logits_BLV
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
+        f = self.vae_proxy[0].img_to_f(lq)
+        control = f.reshape(B, self.Cvae, self.first_l).permute(0, 2, 1)
         with torch.cuda.amp.autocast(enabled=False):
-            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            sos = cond_BD = self.class_emb(label_B)
-
-            sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
-
+            control_tokens = self.control_embed(control)
             if self.prog_si == 0:
-                x_BLC = sos
+                x_BLC = control_tokens
             else:
-                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+                x_BLC = torch.cat((control_tokens, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
-
+        idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
+        cond = self.class_emb(idx0)
+        cond_gss = self.shared_ada_lin(cond) if self.shared_aln else cond
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
 
         x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
 
         AdaLNSelfAttn.forward
-        print(cond_BD_or_gss.shape)
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        print(x_BLC.shape)
-        # x_BLC torch.Size([1, 680, 1024])
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
-
-        if self.prog_si == 0:
-            if isinstance(self.word_embed, nn.Linear):
-                x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
-            else:
-                s = 0
-                for p in self.word_embed.parameters():
-                    if p.requires_grad:
-                        s += p.view(-1)[0] * 0
-                x_BLC[0, 0, 0] += s
+            x_BLC = b(x=x_BLC, cond_BD=cond_gss, attn_bias=attn_bias)
+        # f = self.proj(x_BLC[:, :self.first_l]).permute(0, 2, 1).reshape(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=cond)
+        x_BLC = x_BLC[:, self.first_l-1:]
         return x_BLC  # logits BLV, V is vocab_size
 
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
@@ -328,30 +304,94 @@ class VAR(nn.Module):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 
-class VARHF(VAR, PyTorchModelHubMixin):
-            # repo_url="https://github.com/FoundationVision/VAR",
-            # tags=["image-generation"]):
-    def __init__(
-        self,
-        vae_kwargs,
-        num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
-        attn_l2_norm=False,
-        patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
-        flash_if_available=True, fused_if_available=True,
-    ):
-        vae_local = VQVAE(**vae_kwargs)
-        super().__init__(
-            vae_local=vae_local,
-            num_classes=num_classes, depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
-            norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,
-            attn_l2_norm=attn_l2_norm,
-            patch_nums=patch_nums,
-            flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-        )
+    def load_state_dict(self, state_dict: Dict[str, Any],
+                        strict: bool = True, assign: bool = False, compat=False):
+        compat = True
+        for key in list(state_dict.keys()):
+            if key.find('control_embed') != -1:
+                compat = False
+                strict = True
+                break
+
+        if compat:
+            strict = False
+        if compat:
+            # compat encoder and decoder
+            new_state_dict = OrderedDict()
+            for key in list(state_dict.keys()):
+                if key.find('pos_1LC') != -1:
+                    pass
+                elif key.find('class_emb') != -1:
+                    pass
+                elif key.find('pos_start') != -1:
+                    pass
+                elif key.find('lvl_1L') != -1:
+                    pass
+                elif key.find('attn_bias_for_masking') != -1:
+                    pass
+                elif self.shared_aln and key.find('shared_ada_lin') != -1:
+                    pass
+                else:
+                    new_state_dict[key] = state_dict.pop(key)
+        else:
+            new_state_dict = state_dict
+        return super().load_state_dict(state_dict=new_state_dict, strict=strict, assign=assign)
 
 
 if __name__ == '__main__':
+    import argparse
+    import glob
+    import math
+
+    import PIL.Image as PImage
+    import torch
+
+    from utils import dist_utils
+    from utils import arg_util
+    from utils.dataset.options import DataOptions
+    from torch.utils.data import DataLoader
+
+    args = arg_util.init_dist_and_get_args()
+
+    device = 'cpu'
+    seed = args.seed
+    import random
+
+    def seed_everything(self):
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        if self.seed is not None:
+            print(f'[in seed_everything] {self.deterministic=}', flush=True)
+            if self.deterministic:
+                torch.backends.cudnn.benchmark = False
+                torch.backends.cudnn.deterministic = True
+                torch.use_deterministic_algorithms(True)
+                os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+            seed = self.seed + dist_utils.get_rank() * 16384
+            os.environ['PYTHONHASHSEED'] = str(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            self.same_seed_for_all_ranks = seed
+
+
+    def normalize_01_into_pm1(x):  # normalize x from [0, 1] to [-1, 1] by (x*2) - 1
+        return x.add(x).add_(-1)
+
+
+    def denormalize_pm1_into_01(x):  # normalize x from [-1, 1] to [0, 1] by (x + 1)/2
+        return x.add(1) / 2
+
+    import sys
+    from pathlib import Path
+    import os
+    from pprint import pprint
+
+    root = Path(os.path.dirname(__file__)).parent
+
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
     # VQVAE args
     V = 4096
@@ -367,22 +407,100 @@ if __name__ == '__main__':
     init_adaln_gamma = 1e-5
     init_head = 0.02
     init_std = -1
-
     vae_local = VQVAE(vocab_size=V, z_channels=Cvae, ch=ch, test_mode=True, share_quant_resi=share_quant_resi,
                       v_patch_nums=patch_nums)
-    vae_local.load_state_dict(torch.load('/Users/katz/Downloads/vae_ch160v4096z32.pth', map_location='cpu'))
 
     heads = depth
     width = depth * 64
     dpr = 0.1 * depth / 24
     var_wo_ddp = VAR(
-        vae_local=vae_local, num_classes=1000,
+        vae_local=vae_local,
         depth=depth, embed_dim=width, num_heads=heads, drop_rate=0., attn_drop_rate=0.,
         drop_path_rate=dpr,
-        norm_eps=1e-6, shared_aln=shared_aln, cond_drop_rate=0.1,
+        norm_eps=1e-6, shared_aln=shared_aln,
         attn_l2_norm=attn_l2_norm,
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     )
+    vae_local.eval()
+    var_wo_ddp.eval()
+    if args.resume != '':
+        var_ckpt = torch.load(args.resume, map_location='cpu')
+        if 'trainer' in var_ckpt.keys():
+            vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
+            var_wo_ddp.load_state_dict(var_ckpt['trainer']['var_wo_ddp'], strict=True, compat=False)
+        else:
+            # vae_local.load_state_dict(var_ckpt['trainer']['vae_local'])
+            missing_keys, unexpected_keys = var_wo_ddp.load_state_dict(var_ckpt, strict=False, compat=True)
+            print('missing_keys: ', [k for k in missing_keys])
+            print('unexpected_keys: ', [k for k in unexpected_keys])
 
-    # var_wo_ddp.load_state_dict(torch.load('../var_d16.pth', map_location='cpu'))
+    import torchvision
+    import numpy as np
+
+    # test
+    opt = DataOptions.test_options()
+    pprint(opt)
+
+    import torch.utils.data as data
+    from utils.data import build_data_loader, build_dataset
+    import PIL.Image as PImage
+
+    def test_ep(ld_test: DataLoader, ep: int, out_dir: Path):
+        vis_root = out_dir / f'{ep:04d}'
+        vis_root.mkdir(parents=True, exist_ok=True)
+        vis_max_count = 16
+        vis_count = 0
+        lq_list = []
+        hq_list = []
+        lq_res_list = []
+        hq_res_list = []
+        for i, data in enumerate(ld_test):
+            data: dict
+            lq, hq = data['lq'], data['gt']
+            B, V = lq.shape[0], vae_local.vocab_size
+            lq = lq.to(dist_utils.get_device(), non_blocking=True)
+            hq = hq.to(dist_utils.get_device(), non_blocking=True)
+            lq_list.append(lq)
+            hq_list.append(hq)
+
+            lq_res = var_wo_ddp.autoregressive_infer_cfg(lq)
+            hq_res = var_wo_ddp.autoregressive_infer_cfg(hq)
+            lq_res_list.append(lq_res)
+            hq_res_list.append(hq_res)
+            vis_count += 1
+            if i == len(ld_test)-1 or vis_count % vis_max_count == 0:
+                # save img
+                mid = vis_count // 2
+                lq_left, lq_right = lq_list[:mid], lq_list[-mid:]
+                hq_left, hq_right = hq_list[:mid], hq_list[-mid:]
+                lq_res_list_left, lq_res_list_right = lq_res_list[:mid], lq_res_list[-mid:]
+                hq_res_list_left, hq_res_list_right = hq_res_list[:mid], hq_res_list[-mid:]
+
+                res = [
+                    torch.cat(hq_left), torch.cat(lq_left), torch.cat(hq_res_list_left), torch.cat(lq_res_list_left),
+                    torch.cat(hq_right), torch.cat(lq_right), torch.cat(hq_res_list_right), torch.cat(lq_res_list_right),
+                ]
+
+                res_img = torch.stack(res, dim=1)
+                res_img = torch.reshape(res_img, (-1, 3, 256, 256))
+                img = denormalize_pm1_into_01(res_img)
+                chw = torchvision.utils.make_grid(img, nrow=len(res), padding=0, pad_value=1.0)
+                chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
+                chw = PImage.fromarray(chw.astype(np.uint8))
+                filename = f'{i:06d}.png'
+                filepath = os.path.join(vis_root, filename)
+                chw.save(filepath)
+                print(f'@{ep} saved {filepath}, images: {vis_count}')
+
+                if (len(ld_test) - i - 1) // vis_max_count == 0:
+                    break
+                vis_count = 0
+
+
+    ds = build_dataset(args.dataset_name_test, args.data_path_test,
+                            {'opt': opt}, split='test')
+    ld = build_data_loader(args, 0, 0, dataset=ds,
+                               dataset_params={'opt': opt}, split='test')
+    out_dir = Path(args.visual_out_dir_path).parent / 'visual_output_tmp'
+    test_ep(ld, 0, out_dir)

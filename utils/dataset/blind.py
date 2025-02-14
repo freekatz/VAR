@@ -1,5 +1,4 @@
 import math
-import os
 import random
 
 import cv2
@@ -12,23 +11,16 @@ from basicsr.data import degradations as degradations
 from basicsr.data.transforms import augment
 from basicsr.utils import img2tensor
 
-from utils.dataset.my_transforms import cv2_loader, random_add_jpg_compression, normalize_01_into_pm1, \
-    random_add_gaussian_noise, denormalize_pm1_into_01, pil_loader
+from utils.dataset.my_transforms import random_add_jpg_compression, normalize_01_into_pm1, \
+    random_add_gaussian_noise, denormalize_pm1_into_01
 from utils.dataset.options import DataOptions
 
 
-class FFHQBlind(data.Dataset):
-    def __init__(self, root, opt, split='train', **kwargs):
+class BlindDataset(data.Dataset):
+    def __init__(self, base_dataset: data.Dataset, opt: DataOptions, **kwargs):
         super().__init__()
-        self.root = root
+        self.base = base_dataset
         self.opt = opt
-
-        # load dataset
-        split_file = os.path.join(self.root, f'ffhq_{split}.txt')
-        with open(split_file, 'r') as file:
-            self.samples = [os.path.join(self.root, line.strip()) for line in file.readlines()]
-        assert (len(self.samples) > 0)
-        self.loader = pil_loader
 
         self.mid_size = opt['mid_size']
         self.out_size = opt['out_size']
@@ -125,7 +117,7 @@ class FFHQBlind(data.Dataset):
         return locations
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.base)
 
     def generate_lq(self, img_gt):
         h, w, _ = img_gt.shape
@@ -174,8 +166,7 @@ class FFHQBlind(data.Dataset):
 
     def __getitem__(self, index):
         # load gt image
-        path = self.samples[index]
-        img_gt = self.loader(path)
+        img_gt = self.base[index]
 
         # resize and random crop
         if self.mid_size > self.out_size and random.random() < self.random_crop_ratio:
@@ -220,13 +211,16 @@ if __name__ == '__main__':
     import torch
     import cv2
 
-    data = '../../tmp'
+    from utils.dataset.ffhq import FFHQ
+
+    data = '../../tmp/dataset1'
     # validate
     from pprint import pprint
     opt = DataOptions.val_options()
     pprint(opt)
 
-    ds = FFHQBlind(root=data, split='train', opt=opt)
+    base_ds = FFHQ(root=data, split='train')
+    ds = BlindDataset(base_dataset=base_ds, opt=opt)
     res = ds[0]
     lq, hq = res['lq'], res['gt']
     print(lq.size())

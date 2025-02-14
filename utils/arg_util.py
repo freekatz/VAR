@@ -25,8 +25,10 @@ from utils import dist_utils
 class Args(Tap):
     exp_name: str = 'text'
     resume: str = ''            # if specified, load this checkpoint; if not, load the latest checkpoint in bed (if existing)
-    data_path: str = 'dataset_link' # datasets, split by - or _, o: openimages, cc: cc12m, co: coco, fa: face data(ffhq+HumanArt+afhq+Internal), mj: midjourney, p: pinterest, px: (pexels+pixabay+unsplash)
+    data_path: str = '' # datasets, split by - or _, o: openimages, cc: cc12m, co: coco, fa: face data(ffhq+HumanArt+afhq+Internal), mj: midjourney, p: pinterest, px: (pexels+pixabay+unsplash)
+    data_path_test: str = '' # datasets, split by - or _, o: openimages, cc: cc12m, co: coco, fa: face data(ffhq+HumanArt+afhq+Internal), mj: midjourney, p: pinterest, px: (pexels+pixabay+unsplash)
     dataset_name: str = 'ffhq_blind'
+    dataset_name_test: str = 'celeba_hq_blind'
     pretrain: str = ''
     vae_path: str = ''
 
@@ -53,8 +55,7 @@ class Args(Tap):
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
     ac: int = 1             # gradient accumulation
-    prof: bool = False      # whether to do profile
-    profall: bool = False   # whether to do profile on all ranks
+    test_freq: int = 1
     save_freq: int = 1
 
     ep: int = 100
@@ -112,6 +113,7 @@ class Args(Tap):
     
     # environment
     local_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # [automatically set; don't specify this]
+    visual_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'visual_output')
     tb_log_dir_path: str = '...tb-...'  # [automatically set; don't specify this]
     log_txt_path: str = '...'           # [automatically set; don't specify this]
     last_ckpt_path: str = '...'         # [automatically set; don't specify this]

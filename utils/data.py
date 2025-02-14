@@ -1,34 +1,27 @@
-import os.path as osp
-from typing import List, Dict
-
 import PIL.Image as PImage
 from torch.utils.data import DataLoader
-from torchvision.datasets import DatasetFolder
-from torchvision.transforms import InterpolationMode, transforms
 
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils import dist_utils
-from utils import arg_util
+from utils.dataset.blind import BlindDataset
+from utils.dataset.celeba_hq import CelebAHQ
 from utils.dataset.ffhq import FFHQ
-from utils.dataset.ffhq_blind import FFHQBlind
-from utils.dataset.ffhq_blind_uneven import FFHQBlindUneven
-from utils.dataset.img_folder import UnlabeledDatasetFolder
 
 
 def build_dataset(
     dataset_name: str, data_path: str, params: dict, split='train'
 ):
     print('Building dataset: dataset_name={}, split={}'.format(dataset_name, split))
-    if dataset_name == 'imagenet':
-        dataset = UnlabeledDatasetFolder(root=data_path, split=split, **params)
-    elif dataset_name == 'ffhq':
+    if dataset_name in ['ffhq']:
         dataset = FFHQ(root=data_path, split=split, **params)
-    elif dataset_name == 'ffhq_blind':
-        if split == 'train':
-            # dataset = FFHQBlindUneven(root=data_path, split=split, **params)
-            dataset = FFHQBlind(root=data_path, split=split, **params)
-        else:
-            dataset = FFHQBlind(root=data_path, split=split, **params)
+    elif dataset_name in ['ffhq_blind']:
+        base_dataset = FFHQ(root=data_path, split=split, **params)
+        dataset = BlindDataset(base_dataset=base_dataset, **params)
+    elif dataset_name in ['celeba_hq']:
+        dataset = CelebAHQ(root=data_path, split=split, **params)
+    elif dataset_name in ['celeba_hq_blind']:
+        base_dataset = CelebAHQ(root=data_path, split=split, **params)
+        dataset = BlindDataset(base_dataset=base_dataset, **params)
     else:
         raise NotImplementedError
     print(f'Dataset {dataset.__class__} size: {len(dataset)}')
@@ -54,6 +47,12 @@ def build_data_loader(args, start_ep, start_it, dataset=None, dataset_params=Non
             dataset, num_workers=0, pin_memory=True,
             batch_size=round(args.batch_size*1.5),
             sampler=EvalDistributedSampler(dataset, num_replicas=dist_utils.get_world_size(), rank=dist_utils.get_rank()),
+            shuffle=False, drop_last=False,
+        )
+    elif split == 'test':
+        data_loader = DataLoader(
+            dataset, num_workers=0, pin_memory=True,
+            batch_size=1,
             shuffle=False, drop_last=False,
         )
     else:
