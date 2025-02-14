@@ -1,4 +1,4 @@
-name: vqvae
+name: var
 channels:
   - pytorch
   - nvidia
