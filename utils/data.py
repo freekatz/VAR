@@ -6,6 +6,7 @@ from utils import dist_utils
 from utils.dataset.blind import BlindDataset
 from utils.dataset.celeba_hq import CelebAHQ
 from utils.dataset.ffhq import FFHQ
+from utils.dataset.img_folder import UnlabeledImageFolder
 
 
 def build_dataset(
@@ -21,6 +22,9 @@ def build_dataset(
         dataset = CelebAHQ(root=data_path, split=split, **params)
     elif dataset_name in ['celeba_hq_blind']:
         base_dataset = CelebAHQ(root=data_path, split=split, **params)
+        dataset = BlindDataset(base_dataset=base_dataset, **params)
+    elif dataset_name in ['image_folder_blind']:
+        base_dataset = UnlabeledImageFolder(root=data_path, split=split, **params)
         dataset = BlindDataset(base_dataset=base_dataset, **params)
     else:
         raise NotImplementedError
