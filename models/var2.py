@@ -223,8 +223,8 @@ class VAR2(nn.Module):
                 x_BLC = torch.cat((control_tokens, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  # lvl: BLC;  pos: 1LC
         idx0 = self.vae_quant_proxy[0].f_to_idxBl_or_fhat(f, to_fhat=False, stop_si=0)[0]
-        c = self.class_emb(idx0)
-        c_gss = self.shared_ada_lin(c) if self.shared_aln else c
+        cond = self.class_emb(idx0)
+        cond_gss = self.shared_ada_lin(cond) if self.shared_aln else cond
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
 
         # hack: get the dtype if mixed precision is used
@@ -236,9 +236,9 @@ class VAR2(nn.Module):
 
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=c_gss, attn_bias=attn_bias)
+            x_BLC = b(x=x_BLC, cond_BD=cond_gss, attn_bias=attn_bias)
         # f = self.proj(x_BLC[:, :self.first_l]).permute(0, 2, 1).reshape(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD=c)
+        x_BLC = self.get_logits(x_BLC.float(), cond_BD=cond)
         x_BLC = x_BLC[:, self.first_l-1:]
         return x_BLC  # logits BLV, V is vocab_size
 
@@ -440,11 +440,12 @@ if __name__ == '__main__':
             print('unexpected_keys: ', [k for k in unexpected_keys])
 
     from utils.dataset.ffhq_blind import FFHQBlind
+    from utils.dataset.ffhq_blind_uneven import FFHQBlindUneven
     import torchvision
     import numpy as np
 
-    # validate
-    opt = DataOptions.val_options()
+    # test
+    opt = DataOptions.test_options()
     pprint(opt)
 
     import json

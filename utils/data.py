@@ -25,7 +25,8 @@ def build_dataset(
         dataset = FFHQ(root=data_path, split=split, **params)
     elif dataset_name == 'ffhq_blind':
         if split == 'train':
-            dataset = FFHQBlindUneven(root=data_path, split=split, **params)
+            # dataset = FFHQBlindUneven(root=data_path, split=split, **params)
+            dataset = FFHQBlind(root=data_path, split=split, **params)
         else:
             dataset = FFHQBlind(root=data_path, split=split, **params)
     else:
