@@ -15,6 +15,6 @@ download: https://www.kaggle.com/datasets/lamsimon/celebahq/data
 split dataset:
 ```shell
 # test set 160
-python scripts/split_dataset.py --dataset ffhq -o <celeba_1024_dir> -n '_2_160' --sort
+python scripts/split_dataset.py --dataset celeba -o <celeba_1024_dir> -n '_2_160' --sort
 ```
 
