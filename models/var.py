@@ -1,7 +1,7 @@
 import math
 from collections import OrderedDict
 from functools import partial
-from typing import Optional, Tuple, Union, Mapping, Any, Dict
+from typing import Optional, Tuple, Union, Mapping, Any, Dict, List
 import sys, os
 
 
@@ -144,8 +144,8 @@ class VAR(nn.Module):
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
-            self, lq: torch.Tensor, top_k=0, top_p=0.0,
-    ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
+            self, lq: torch.Tensor, top_k=0, top_p=0.0, to_idx: bool = False,
+    ) -> Union[torch.Tensor, List[torch.LongTensor]]:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         B = lq.shape[0]
 
         f = self.vae_proxy[0].img_to_f(lq)
@@ -161,6 +161,7 @@ class VAR(nn.Module):
         f_hat = control_tokens.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
         for b in self.blocks: b.attn.kv_caching(True)
+        idx = []
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
             if si == 0:
                 cur_L += self.first_l
@@ -175,6 +176,8 @@ class VAR(nn.Module):
             if si == 0:
                 logits_BlV = logits_BlV[:, -1, :].unsqueeze(1)
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=None, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            if to_idx:
+                idx.append(idx_Bl)
             h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
 
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
@@ -186,7 +189,7 @@ class VAR(nn.Module):
                 next_token_map += lvl_pos[:,cur_L:cur_L + self.patch_nums[si + 1] ** 2]
 
         for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat)  # de-normalize, from [-1, 1] to [0, 1]
+        return self.vae_proxy[0].fhat_to_img(f_hat) if not to_idx else idx
 
     def forward(self, lq: torch.FloatTensor, x_BLCv_wo_first_l: torch.Tensor) -> (torch.Tensor, torch.Tensor):  # returns logits_BLV
         bg, ed = (0, self.L)

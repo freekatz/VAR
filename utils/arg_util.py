@@ -10,6 +10,8 @@ from typing import Optional, Union
 import numpy as np
 import torch
 
+from utils.common import seed_everything
+
 try:
     from tap import Tap
 except ImportError as e:
@@ -116,21 +118,6 @@ class Args(Tap):
     device: str = 'cpu'     # [automatically set; don't specify this]
     # seed: int = None        # seed
     seed: int = np.random.randint(1, 10000)        # seed
-    def seed_everything(self, benchmark: bool):
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = benchmark
-        if self.seed is None:
-            torch.backends.cudnn.deterministic = False
-        else:
-            torch.backends.cudnn.deterministic = True
-            seed = self.seed * dist_utils.get_world_size() + dist_utils.get_rank()
-            os.environ['PYTHONHASHSEED'] = str(seed)
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
     same_seed_for_all_ranks: int = 0     # this is only for distributed sampler
     def get_different_generator_for_each_rank(self) -> Optional[torch.Generator]:   # for random augmentation
         if self.seed is None:
@@ -231,7 +218,7 @@ def init_dist_and_get_args():
     
     # set env
     args.set_tf32(args.tf32)
-    args.seed_everything(benchmark=True)
+    args.same_seed_for_all_ranks = seed_everything(args.seed, benchmark=True)
     
     # update args: data loading
     args.device = dist_utils.get_device()

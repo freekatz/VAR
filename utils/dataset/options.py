@@ -9,6 +9,21 @@ class DataOptions(dict):
         super().__init__(opt)
 
     @classmethod
+    def get_splits(cls):
+        return ['train', 'val', 'test']
+
+    @classmethod
+    def get_options(cls, split='train'):
+        if split == 'train':
+            return DataOptions.train_options()
+        elif split == 'val':
+            return DataOptions.val_options()
+        elif split == 'test':
+            return DataOptions.test_options()
+        else:
+            raise NotImplementedError
+
+    @classmethod
     def train_options(cls, **kwargs):
         opt = {
             'out_size': 256,

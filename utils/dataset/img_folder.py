@@ -7,14 +7,15 @@ from utils.dataset.my_transforms import pil_loader
 
 
 class UnlabeledImageFolder(data.Dataset):
-    def __init__(self, root, split='train', by_name=False, **kwargs):
+    def __init__(self, root, split='train', **kwargs):
         super().__init__()
         self.root = root
 
         # load dataset
         split_file = os.path.join(self.root, f'{split}.txt')
+        load_by_name = kwargs.get('load_by_name', True)
 
-        if by_name:
+        if load_by_name:
             with open(split_file, 'r') as file:
                 self.samples = [os.path.join(root, line.strip()) for line in file.readlines()]
         else:

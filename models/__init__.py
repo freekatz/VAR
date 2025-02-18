@@ -43,8 +43,9 @@ def build_vae_var(
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
     ).to(device)
-    if (args.pretrain is None or args.pretrain == '') or (args.resume is None or args.resume == ''):
-        var_local.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
-                            init_std=init_std)
+    if args is not None:
+        if (args.pretrain is None or args.pretrain == '') or (args.resume is None or args.resume == ''):
+            var_local.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head,
+                                   init_std=init_std)
 
     return vae_local, var_local

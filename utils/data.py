@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils import dist_utils
+from utils.dataset import UnlabeledImageItem
 from utils.dataset.blind import BlindDataset
 from utils.dataset.celeba_hq import CelebAHQ
 from utils.dataset.ffhq import FFHQ
@@ -10,8 +11,10 @@ from utils.dataset.img_folder import UnlabeledImageFolder
 
 
 def build_dataset(
-    dataset_name: str, data_path: str, params: dict, split='train'
+    dataset_name: str, data_path: str, params: dict=None, split='train'
 ):
+    if params is None:
+        params = {}
     print('Building dataset: dataset_name={}, split={}'.format(dataset_name, split))
     if dataset_name in ['ffhq']:
         dataset = FFHQ(root=data_path, split=split, **params)
@@ -25,6 +28,9 @@ def build_dataset(
         dataset = BlindDataset(base_dataset=base_dataset, **params)
     elif dataset_name in ['image_folder_blind']:
         base_dataset = UnlabeledImageFolder(root=data_path, split=split, **params)
+        dataset = BlindDataset(base_dataset=base_dataset, **params)
+    elif dataset_name in ['image_item_blind']:
+        base_dataset = UnlabeledImageItem(root=data_path, split=split, **params)
         dataset = BlindDataset(base_dataset=base_dataset, **params)
     else:
         raise NotImplementedError
