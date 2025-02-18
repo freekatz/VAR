@@ -212,6 +212,7 @@ if __name__ == '__main__':
     import cv2
 
     from utils.dataset.ffhq import FFHQ
+    from utils.dataset.celeba_hq import CelebAHQ
 
     data = '../../tmp/dataset1'
     # validate
@@ -219,9 +220,9 @@ if __name__ == '__main__':
     opt = DataOptions.val_options()
     pprint(opt)
 
-    base_ds = FFHQ(root=data, split='train')
+    base_ds = FFHQ(root=data, split='train', load_by_name=True)
     ds = BlindDataset(base_dataset=base_ds, opt=opt)
-    res = ds[0]
+    res = ds[-1]
     lq, hq = res['lq'], res['gt']
     print(lq.size())
     print(hq.size())

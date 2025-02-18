@@ -11,13 +11,15 @@ class FFHQ(data.Dataset):
         super().__init__()
         self.root = root
 
-        all_samples = glob.glob(os.path.join(self.root, '*.png'))
-        print(f'FFHQ total samples: {len(all_samples)}')
+        load_by_name = kwargs.get('load_by_name', False)
+        if not load_by_name:
+            all_samples = glob.glob(os.path.join(self.root, '*.png'))
+            print(f'FFHQ total samples: {len(all_samples)}')
 
         # load dataset
         split_file = os.path.join(self.root, f'{split}.txt')
         with open(split_file, 'r') as file:
-            self.samples = [all_samples[int(line.strip())] for line in file.readlines()]
+            self.samples = [all_samples[int(line.strip())] if not load_by_name else os.path.join(self.root, line.strip()) for line in file.readlines()]
         assert (len(self.samples) > 0)
         self.loader = pil_loader
 

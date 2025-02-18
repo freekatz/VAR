@@ -469,7 +469,7 @@ if __name__ == '__main__':
                     break
                 vis_count = 0
 
-    params = {'opt': opt, 'by_name': True}
+    params = {'opt': opt, 'load_by_name': True}
     ds = build_dataset(args.dataset_name_test, args.data_path_test,
                             params, split='test')
     ld = build_data_loader(args, 0, 0, dataset=ds,
