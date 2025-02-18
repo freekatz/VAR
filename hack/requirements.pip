@@ -2,6 +2,7 @@ basicsr
 colorama
 flash-attn
 GPUtil
+lpips
 pyiqa
 seaborn
 termcolor

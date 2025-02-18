@@ -126,7 +126,9 @@ if __name__ == '__main__':
 
     seed_everything(args.seed, benchmark=True)
 
-    data_params = {'opt': DataOptions.get_options(args.split)}
+    data_opt = DataOptions.get_options(args.split)
+    pprint(data_opt)
+    data_params = {'opt': data_opt}
     dataset = build_dataset(
         dataset_name=args.dataset_name,
         data_path=args.data_path,
