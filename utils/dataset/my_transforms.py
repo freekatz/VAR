@@ -58,6 +58,11 @@ def denormalize_pm1_into_01(x):  # denormalize x from [-1, 1] to [0, 1] by (x + 
     return x.add(1)/2
 
 
+def img01_into_img255(x):
+    assert x.min() >= 0
+    return torch.round(x * 255).to(torch.uint8)
+
+
 class DenormTransform(torch.nn.Module):
     def __init__(self):
         super().__init__()

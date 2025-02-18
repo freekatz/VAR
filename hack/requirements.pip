@@ -2,11 +2,14 @@ basicsr
 colorama
 flash-attn
 GPUtil
+pyiqa
 seaborn
 termcolor
 tensorboard==2.12.0
 tensorboardX
 timm
+torch-fidelity
+torchmetrics
 torch_tb_profiler
 transformers[torch]
 typed-argument-parser
