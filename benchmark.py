@@ -188,6 +188,7 @@ if __name__ == '__main__':
         metrics_info['time_cost_avg'].update(time_cost / args.batch_size)
 
         # calculate fid
+        # todo 使用 pyiqa, 运行过程中实时保存 pred, fid 跑完就删, hq 从 dataset 原处读
         fid.update(img01_into_img255(hq), True)
         fid.update(img01_into_img255(pred), False)
         if i > 0 or args.batch_size > 1:
